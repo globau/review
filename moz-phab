@@ -345,8 +345,7 @@ def parse_config(config_list, filter_func=None):
 
 
 def normalise_reviewer(reviewer):
-    """Removes symbols used to signal to arc if a reviewer is a group or blocking,
-    and lowercase.  This provides a canonical form of the reviewer for comparison."""
+    """This provide a canonical form of the reviewer for comparison."""
     return reviewer.lstrip("#").rstrip("!").lower()
 
 
