@@ -1346,6 +1346,7 @@ class Git(Repository):
 
         commits = []
         rev_list = None
+        first_node = None
         for log_line in self._get_commits_info(*self.revset):
             if not log_line:
                 continue
@@ -1451,7 +1452,6 @@ class Git(Repository):
         )
 
         # Update commit info
-        old_parent_sha = commit["node"]
         commit["node"] = new_parent_sha
         # Update parent for all the children of the `commit` within the stack
         has_children = False
@@ -1467,7 +1467,6 @@ class Git(Repository):
             new_parent_sha = self._commit_tree(
                 new_parent_sha, c["tree-hash"], "%s\n%s" % (c["title"], c["body"])
             )
-            old_parent_sha = c["node"]
             c["node"] = new_parent_sha
 
     def rebase_commit(self, source_commit, dest_commit):
