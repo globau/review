@@ -78,7 +78,7 @@ def test_patch_no_commit(
     hg_out("commit", "--message", "ARCCONFIG")
 
     mozphab.main(["patch", "D1", "--no-commit"])
-    assert [".arcconfig", ".hg", "X"] == os.listdir(str(hg_repo_path))
+    assert [".arcconfig", ".hg", "X"] == sorted(os.listdir(str(hg_repo_path)))
     test_file = hg_repo_path / "X"
     assert "a\n" == test_file.read_text()
     result = hg_out("log", "-G")
@@ -87,7 +87,7 @@ def test_patch_no_commit(
 
     m_arc_conduit.return_value = BIN_PATCH
     mozphab.main(["patch", "D1", "--no-commit"])
-    assert [".arcconfig", ".hg", "sample.bin"] == os.listdir(str(hg_repo_path))
+    assert [".arcconfig", ".hg", "sample.bin"] == sorted(os.listdir(str(hg_repo_path)))
     test_file = hg_repo_path / "sample.bin"
     test_file.unlink()
 
@@ -96,7 +96,7 @@ def test_patch_no_commit(
     m_get_diffs.return_value = {"PHID-DIFF-1": DIFF_1, "PHID-DIFF-2": DIFF_2}
     m_arc_conduit.side_effect = [PATCH_1, PATCH_2]
     mozphab.main(["patch", "D2", "--no-commit"])
-    assert [".arcconfig", ".hg", "X"] == os.listdir(str(hg_repo_path))
+    assert [".arcconfig", ".hg", "X"] == sorted(os.listdir(str(hg_repo_path)))
     test_file = hg_repo_path / "X"
     assert "b\n" == test_file.read_text()
     test_file.unlink()
@@ -128,13 +128,11 @@ def test_git_patch_with_commit(
     m_arc_conduit.return_value = PATCH_1
 
     mozphab.main(["patch", "D1", "--apply-to", "here"])
-    assert [".arcconfig", ".git", "X"] == os.listdir(str(git_repo_path))
+    assert [".arcconfig", ".git", "X"] == sorted(os.listdir(str(git_repo_path)))
     test_file = git_repo_path / "X"
     assert "a\n" == test_file.read_text()
-    result = git_out("log", "--all", "--format=%aD %an <%ae>%n%s %P%n%b")
-    assert 1 == result.count(
-        "Fri, 18 Jan 2019 11:07:58 +0100 user <author@example.com>"
-    )
+    result = git_out("log", "--all", "--format=[%at] %an <%ae>%n%s %P%n%b")
+    assert 1 == result.count("[1547806078] user <author@example.com>")
     assert 1 == result.count("title R1")
     assert 1 == result.count("Differential Revision: http://example.test/D1")
     result = git_out("branch")
@@ -142,13 +140,11 @@ def test_git_patch_with_commit(
 
     time.sleep(1)
     mozphab.main(["patch", "D1"])
-    assert [".arcconfig", ".git", "X"] == os.listdir(str(git_repo_path))
+    assert [".arcconfig", ".git", "X"] == sorted(os.listdir(str(git_repo_path)))
     test_file = git_repo_path / "X"
     assert "a\n" == test_file.read_text()
-    result = git_out("log", "--all", "--format=%aD %an <%ae>%n%s %P%n%b")
-    assert 2 == result.count(
-        "Fri, 18 Jan 2019 11:07:58 +0100 user <author@example.com>"
-    )
+    result = git_out("log", "--all", "--format=[%at] %an <%ae>%n%s %P%n%b")
+    assert 2 == result.count("[1547806078] user <author@example.com>")
     assert 2 == result.count("title R1")
     assert 2 == result.count("Differential Revision: http://example.test/D1")
     result = git_out("branch")
@@ -160,11 +156,11 @@ def test_git_patch_with_commit(
     m_get_diffs.return_value = {"PHID-DIFF-3": diff_1}
     m_arc_conduit.return_value = BIN_PATCH
     mozphab.main(["patch", "D3"])
-    assert [".arcconfig", ".git", "sample.bin"] == os.listdir(str(git_repo_path))
-    result = git_out("log", "--all", "--format=%aD %an <%ae>%n%s %P%n%b")
-    assert 3 == result.count(
-        "Fri, 18 Jan 2019 11:07:58 +0100 user <author@example.com>"
+    assert [".arcconfig", ".git", "sample.bin"] == sorted(
+        os.listdir(str(git_repo_path))
     )
+    result = git_out("log", "--all", "--format=[%at] %an <%ae>%n%s %P%n%b")
+    assert 3 == result.count("[1547806078] user <author@example.com>")
     assert 1 == result.count("title BIN")
     assert 1 == result.count("Differential Revision: http://example.test/D3")
     assert 2 == result.count("title R1")
@@ -180,13 +176,11 @@ def test_git_patch_with_commit(
     m_get_diffs.return_value = {"PHID-DIFF-1": diff_1, "PHID-DIFF-2": DIFF_2}
     m_arc_conduit.side_effect = [PATCH_1, PATCH_2]
     mozphab.main(["patch", "D2"])
-    assert [".arcconfig", ".git", "X"] == os.listdir(str(git_repo_path))
+    assert [".arcconfig", ".git", "X"] == sorted(os.listdir(str(git_repo_path)))
     test_file = git_repo_path / "X"
     assert "b\n" == test_file.read_text()
-    result = git_out("log", "--all", "--format=%aD %an <%ae>%n%s %P%n%b")
-    assert 5 == result.count(
-        "Fri, 18 Jan 2019 11:07:58 +0100 user <author@example.com>"
-    )
+    result = git_out("log", "--all", "--format=[%at] %an <%ae>%n%s %P%n%b")
+    assert 5 == result.count("[1547806078] user <author@example.com>")
     assert 3 == result.count("title R1")
     assert 3 == result.count("Differential Revision: http://example.test/D1")
     assert 1 == result.count("Differential Revision: http://example.test/D2")
@@ -235,20 +229,20 @@ def test_hg_patch_with_commit(
     hg_out("commit", "--message", "ARCCONFIG")
 
     mozphab.main(["patch", "D1", "--apply-to", "here"])
-    assert [".arcconfig", ".hg", "X"] == os.listdir(str(hg_repo_path))
+    assert [".arcconfig", ".hg", "X"] == sorted(os.listdir(str(hg_repo_path)))
     test_file = hg_repo_path / "X"
     assert "a\n" == test_file.read_text()
     result = hg_out("log", "-G")
     assert "@  changeset:   1:" in result
     assert "|  bookmark:    D1" in result
     assert "|  user:        user <author@example.com>" in result
-    assert "|  date:        Fri Jan 18 11:07:58 2019 +0100" in result
+    assert "|  date:        Fri Jan 18" in result
     assert "|  summary:     title R1" in result
     assert "o  changeset:   0:" in result
 
     m_arc_conduit.return_value = BIN_PATCH
     mozphab.main(["patch", "D1"])
-    assert [".arcconfig", ".hg", "sample.bin"] == os.listdir(str(hg_repo_path))
+    assert [".arcconfig", ".hg", "sample.bin"] == sorted(os.listdir(str(hg_repo_path)))
     result = hg_out("log", "-G")
     assert "@  changeset:   2" in result
     assert "|  bookmark:    D1_1" in result
@@ -263,7 +257,9 @@ def test_hg_patch_with_commit(
     m_get_diffs.return_value = {"PHID-DIFF-1": DIFF_1, "PHID-DIFF-2": DIFF_2}
     m_arc_conduit.side_effect = [PATCH_1, PATCH_2]
     mozphab.main(["patch", "D2"])
-    assert [".arcconfig", ".hg", "unknown", "X"] == os.listdir(str(hg_repo_path))
+    assert [".arcconfig", ".hg", "X", "unknown"] == sorted(
+        os.listdir(str(hg_repo_path))
+    )
     test_file = hg_repo_path / "X"
     assert "b\n" == test_file.read_text()
     result = hg_out("log", "-G")
