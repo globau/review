@@ -22,6 +22,7 @@ import errno
 import io
 import json
 import logging
+import logging.handlers
 import os
 import re
 import ssl
@@ -71,6 +72,33 @@ GUIDE_URL = (
     "https://moz-conduit.readthedocs.io/en/latest/phabricator-user.html#quick-start"
 )
 
+GIT_COMMAND = ["git.exe" if IS_WINDOWS else "git"]
+HOME_DIR = os.path.expanduser("~")
+
+# ~/.mozbuild/moz-phab
+MOZBUILD_PATH = os.path.join(
+    os.environ.get("MOZBUILD_STATE_PATH", os.path.join(HOME_DIR, ".mozbuild")),
+    "moz-phab",
+)
+LOG_FILE = os.path.join(MOZBUILD_PATH, "moz-phab.log")
+
+# Arcanist
+LIBPHUTIL_PATH = os.path.join(MOZBUILD_PATH, "libphutil")
+ARC_PATH = os.path.join(MOZBUILD_PATH, "arcanist")
+ARC_COMMAND = os.path.join(ARC_PATH, "bin", "arc.bat" if IS_WINDOWS else "arc")
+ARC = [ARC_COMMAND]
+INSTALL_CERT_MSG = (
+    "You don't have credentials needed to access Phabricator.\n"
+    "Please run the following command to configure moz-phab:\n\n"
+    "   moz-phab install-certificate\n "
+)
+ARC_CONDUIT_ERROR = (
+    {"matching": "install-certificate", "message": INSTALL_CERT_MSG},
+    {"matching": "ERR-INVALID_AUTH", "message": "Server rejected your token."},
+)
+LIBPHUTIL_URL = "https://github.com/phacility/libphutil.git"
+ARC_URL = "https://github.com/mozilla-conduit/arcanist.git"
+
 # Auto-update
 SELF_REPO = "mozilla-conduit/review"
 SELF_UPDATE_FREQUENCY = 24 * 3  # hours
@@ -118,9 +146,8 @@ ARC_REJECT_RE_LIST = [
 BUG_ID_RE = re.compile(r"(?:(?:bug|b=)(?:\s*)(\d+)(?=\b))", flags=re.IGNORECASE)
 LIST = r"[;,\/\\]\s*"
 LIST_RE = re.compile(LIST)
-IRC_NICK = (
-    r"#?[a-zA-Z0-9\-\_!]+"
-)  # Note this includes !, which is different from commitparser
+IRC_NICK_CHARS = r"a-zA-Z0-9\-\_!"  # includes !, which is different from commitparser
+IRC_NICK = r"#?[" + IRC_NICK_CHARS + "]+"
 REVIEWERS_RE = (
     r"([\s(.\[;,])(r%s)("
     + IRC_NICK
@@ -131,9 +158,10 @@ REVIEWERS_RE = (
     + r")*)?"
 )
 ALL_REVIEWERS_RE = re.compile(REVIEWERS_RE % r"[=?]")
-REQUEST_REVIEWERS_RE = re.compile(REVIEWERS_RE % r"\?")
+REQUEST_REVIEWERS_RE = re.compile(REVIEWERS_RE % r"[?]")
 GRANTED_REVIEWERS_RE = re.compile(REVIEWERS_RE % r"=")
 R_SPECIFIER_RE = re.compile(r"\br[=?]")
+BLOCKING_REVIEWERS_RE = re.compile(r"\b(r!)([" + IRC_NICK_CHARS + ",]+)")
 
 DEPENDS_ON_RE = re.compile(r"^\s*Depends on\s*D(\d+)\s*$", flags=re.MULTILINE)
 
@@ -142,6 +170,32 @@ MINIMUM_MERCURIAL_VERSION = LooseVersion("4.3.3")
 #
 # Utilities
 #
+
+
+class SimpleCache:
+    """Simple key/value store with all lowercase keys."""
+
+    def __init__(self):
+        self._cache = dict()
+
+    def __contains__(self, key):
+        return key.lower() in self._cache
+
+    def get(self, key):
+        return self._cache.get(key.lower())
+
+    def set(self, key, value):
+        self._cache[key.lower()] = value
+
+    def delete(self, key):
+        if key in self:
+            del self._cache[key.lower()]
+
+    def reset(self):
+        self._cache = dict()
+
+
+cache = SimpleCache()
 
 
 def which_path(path):
@@ -207,7 +261,8 @@ def check_call_by_line(command, cwd=None, never_log=False):
     # similar to check_call, yields for line-by-line processing
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
 
-    # Connecting the STDIN to the PIPE will make arc throw an exception on reading user input
+    # Connecting the STDIN to the PIPE will make arc throw an exception on reading
+    # user input
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stdin=subprocess.PIPE, cwd=cwd
     )
@@ -234,6 +289,7 @@ def check_output(
     stdin=None,
     stderr=None,
     env=None,
+    search_error=None,
 ):
     # wrapper around subprocess.check_output with debug output and splitting
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
@@ -244,6 +300,11 @@ def check_output(
     try:
         output = subprocess.check_output(command, **kwargs)
     except subprocess.CalledProcessError as e:
+        if search_error:
+            for err in search_error:
+                if err["matching"] in e.output:
+                    logger.error(err["message"])
+
         logger.debug(e.output)
         raise CommandError(
             "command '%s' failed to complete successfully" % command[0], e.returncode
@@ -378,7 +439,7 @@ class ConduitAPIError(Error):
 
 class Config(object):
     def __init__(self, should_access_file=True):
-        self._filename = os.path.join(os.path.expanduser("~"), ".moz-phab-config")
+        self._filename = os.path.join(HOME_DIR, ".moz-phab-config")
         self.name = "~/.moz-phab-config"  # human-readable name
 
         # Default values.
@@ -389,8 +450,8 @@ class Config(object):
             [vcs]
             safe_mode = False
 
-            [arc]
-            arc_command = arc
+            [git]
+            remote =
 
             [submit]
             auto_submit = False
@@ -412,16 +473,14 @@ class Config(object):
             io.StringIO("\n".join([l.strip() for l in defaults.splitlines()]))
         )
 
-        # the `arc_command` default value depends on the operating system
-        if IS_WINDOWS:
-            self._set("arc", "arc_command", "arc.bat")
+        if self._config.has_section("arc"):
+            self._config.remove_section("arc")
 
         if should_access_file:
             self._config.read([self._filename])
 
         self.no_ansi = self._config.getboolean("ui", "no_ansi")
         self.safe_mode = self._config.getboolean("vcs", "safe_mode")
-        self.arc_command = self._config.get("arc", "arc_command")
         self.auto_submit = self._config.getboolean("submit", "auto_submit")
         self.always_blocking = self._config.getboolean("submit", "always_blocking")
         self.warn_untracked = self._config.getboolean("submit", "warn_untracked")
@@ -430,6 +489,8 @@ class Config(object):
         self.always_full_stack = self._config.getboolean("patch", "always_full_stack")
         self.self_last_check = self._config.getint("updater", "self_last_check")
         self.arc_last_check = self._config.getint("updater", "arc_last_check")
+        git_remote = self._config.get("git", "remote")
+        self.git_remote = git_remote.replace(" ", "").split(",") if git_remote else []
 
         if should_access_file and not os.path.exists(self._filename):
             self.write()
@@ -453,7 +514,7 @@ class Config(object):
             logger.debug("creating %s" % self._filename)
             self._set("ui", "no_ansi", self.no_ansi)
             self._set("vcs", "safe_mode", self.safe_mode)
-            self._set("arc", "arc_command", self.arc_command)
+            self._set("git", "remote", ", ".join(self.git_remote))
             self._set("submit", "auto_submit", self.auto_submit)
             self._set("submit", "always_blocking", self.always_blocking)
             self._set("submit", "warn_untracked", self.warn_untracked)
@@ -741,6 +802,11 @@ class Mercurial(Repository):
         self.revset = None
         self.strip_nodes = []
         self.status = None
+        self.obsstore = None
+        self.unlink_obsstore = False
+        self.use_evolve = False
+        self.has_mq = False
+        self.has_shelve = False
 
         # Normalise/standardise Mercurial's output.
         os.environ["HGPLAIN"] = "1"
@@ -948,6 +1014,10 @@ class Mercurial(Repository):
             strip=False,
         )[: -len(boundary)]
 
+        # Guard against conditions where the stack is empty (see bug 1547083).
+        if not hg_log:
+            return []
+
         commits = []
         nodes = []
         branching_children = []
@@ -1009,7 +1079,7 @@ class Mercurial(Repository):
 
     def commit(self, body):
         """Commit the changes in the working directory."""
-        with temporary_file(body) as temp_f:
+        with temporary_file(body.encode("utf8")) as temp_f:
             self.hg(["commit", "--logfile", temp_f])
 
     def before_patch(self, node, name):
@@ -1045,11 +1115,13 @@ class Mercurial(Repository):
         if author_date:
             commands.extend(["-d", author_date])
 
-        with temporary_file(diff) as patch_file, temporary_file(body) as body_file:
+        with temporary_file(diff) as patch_file, temporary_file(
+            body.encode("utf8")
+        ) as body_file:
             self.hg(["import", patch_file, "-l", body_file] + commands)
 
     def _amend_commit_body(self, node, body):
-        with temporary_file(body) as body_file:
+        with temporary_file(body.encode("utf8")) as body_file:
             self.checkout(node)
             self.hg(["commit", "--amend", "--logfile", body_file])
 
@@ -1253,9 +1325,7 @@ class Git(Repository):
 
         logger.debug("found git repo in %s" % path)
 
-        self._git = ["git.exe" if IS_WINDOWS else "git"]
-        if not which_path(self._git[0]):
-            raise Error("Failed to find 'git' executable")
+        self._git = GIT_COMMAND[:]
 
         # `self._env` is a dict representing environment used in all git commands.
         self._env = os.environ.copy()
@@ -1363,10 +1433,10 @@ class Git(Repository):
     def _get_first_unpublished_node(self):
         """Check which commits should be pushed and return the oldest one."""
         cherry = ["cherry", "--abbrev=12"]
-        remotes = []
+        remotes = config.git_remote
         if self.args.upstream:
             cherry += self.args.upstream
-        else:
+        elif not remotes:
             remotes = self.git_out(["remote"])
             if len(remotes) > 1:
                 logger.warning(
@@ -1628,7 +1698,8 @@ class Git(Repository):
                 elif not self.is_node(hashtag):
                     # the found hashtag is not a valid node in the repository.
                     raise NotFoundError(
-                        "Mercurial SHA1 detected, but commit not found in the repository."
+                        "Mercurial SHA1 detected, but commit not found in the "
+                        "repository."
                     )
             else:
                 raise NotFoundError("Cinnabar extension not enabled.")
@@ -1651,7 +1722,7 @@ class Git(Repository):
         if author_date:
             commands.append('--date="%s"' % author_date)
 
-        with temporary_file(body) as temp_f:
+        with temporary_file(body.encode("utf8")) as temp_f:
             commands += ["-F", temp_f]
             self.git(commands)
 
@@ -1730,7 +1801,7 @@ class Git(Repository):
         Returns:
             str: SHA1 of the new commit.
         """
-        with temporary_file(message) as message_file:
+        with temporary_file(message.encode("utf8")) as message_file:
             return self.git_out(
                 ["commit-tree", "-p", parent, "-F", message_file, tree_hash],
                 split=False,
@@ -1873,6 +1944,32 @@ def has_arc_rejections(body):
     return all(r.search(body) for r in ARC_REJECT_RE_LIST)
 
 
+def morph_blocking_reviewers(commits):
+    """Automatically fix common typo by replacing r!user with r=user!"""
+
+    def morph_reviewer(matchobj):
+        if matchobj.group(1) == "r!":
+            nick = matchobj.group(2)
+
+            # strip trailing , so we can put it back later
+            if nick.endswith(","):
+                suffix = ","
+                nick = nick[:-1]
+            else:
+                suffix = ""
+
+            # split on comma to support r!a,b -> r=a!,b!
+            return "r=%s%s" % (
+                ",".join(["%s!" % n.rstrip("!") for n in nick.split(",")]),
+                suffix,
+            )
+        else:
+            return matchobj.group(0)
+
+    for commit in commits:
+        commit["title"] = BLOCKING_REVIEWERS_RE.sub(morph_reviewer, commit["title"])
+
+
 def augment_commits_from_body(commits):
     """Extract metadata from commit body as fields.
 
@@ -1972,7 +2069,9 @@ def replace_reviewers(commit_description, reviewers):
         return commit_title.strip() + "\n" + commit_description
 
 
-def show_commit_stack(repo, commits, show_rev_urls=False, show_warnings=False):
+def show_commit_stack(
+    repo, commits, show_rev_urls=False, show_warnings=False, submited=False
+):
     """Log the commit stack in a human readable form."""
 
     # keep output in columns by sizing the action column to the longest rev + 1 ("D")
@@ -1981,13 +2080,33 @@ def show_commit_stack(repo, commits, show_rev_urls=False, show_warnings=False):
     )
     action_template = "(%" + str(max_len) + "s)"
 
+    if not submited:
+        # preload all revisions
+        get_revisions(
+            repo.path, ids=[int(c["rev-id"]) for c in commits if c.get("rev-id")]
+        )
+
     for commit in reversed(commits):
+        change_bug_id = False
         if commit.get("rev-id"):
             action = action_template % ("D" + commit["rev-id"])
+            if not submited:
+                # Check if target bug ID is the same as in the Phabricator revision
+                revision = get_revisions(repo.path, ids=[int(commit["rev-id"])])[0]
+                change_bug_id = (
+                    commit["bug-id"] != revision["fields"]["bugzilla.bug-id"]
+                )
         else:
             action = action_template % "New"
+
         logger.info("%s %s %s" % (action, commit["name"], commit["title-preview"]))
         if show_warnings:
+            if change_bug_id:
+                logger.warning(
+                    "!! Bug ID in Phabricator revision will be changed from %s to %s"
+                    % (revision["fields"]["bugzilla.bug-id"], commit["bug-id"])
+                )
+
             if commit["bug-id-orig"] and commit["bug-id"] != commit["bug-id-orig"]:
                 logger.warning(
                     "!! Bug ID changed from %s to %s"
@@ -1999,6 +2118,39 @@ def show_commit_stack(repo, commits, show_rev_urls=False, show_warnings=False):
 
         if show_rev_urls and commit["rev-id"]:
             logger.warning("-> %s/D%s" % (repo.phab_url.rstrip("/"), commit["rev-id"]))
+
+
+def get_users(cwd, usernames):
+    """Get users using the user.query API.
+
+    Caches the result in the process.
+    Returns a list of existing Phabricator users data.
+    """
+    to_collect = []
+    users = []
+    for user in usernames:
+        u = user.rstrip("!")
+        key = "user-%s" % u
+        if key in cache:
+            users.append(cache.get(key))
+        else:
+            to_collect.append(u)
+
+    if not to_collect:
+        return users
+
+    api_call_args = {"usernames": to_collect}
+    # We're using the deprecated user.query API as the user.search does not
+    # provide the user availability information.
+    # See https://phabricator.services.mozilla.com/conduit/method/user.query/
+    response = arc_call_conduit("user.query", api_call_args, cwd)
+    for user in response:
+        users.append(user)
+        key = "user-%s" % user["userName"]
+        cache.set(key, user)
+        cache.set(user["phid"], key)
+
+    return users
 
 
 def check_for_invalid_reviewers(reviewers, cwd):
@@ -2023,11 +2175,8 @@ def check_for_invalid_reviewers(reviewers, cwd):
 
     users = []
     if all_reviewers:
-        # We're using the deprecated user.query API as the user.search does not
-        # provide the user availability information.
-        # See https://phabricator.services.mozilla.com/conduit/method/user.query/
-        api_call_args = {"usernames": all_reviewers}
-        users = arc_call_conduit("user.query", api_call_args, cwd)
+        users = get_users(cwd, all_reviewers)
+
         found_names = [
             normalise_reviewer(data["userName"], strip_group=False) for data in users
         ]
@@ -2053,13 +2202,16 @@ def check_for_invalid_reviewers(reviewers, cwd):
             for data in result["data"]
         ]
         # We might be searching by the hashtag.
-        if "maps" in result and "slugMap" in result["maps"]:
-            found_groups.extend(
-                [
-                    "#%s" % normalise_reviewer(r)
-                    for r in result["maps"]["slugMap"].keys()
-                ]
-            )
+        try:
+            if result["maps"]["slugMap"]:
+                found_groups.extend(
+                    [
+                        "#%s" % normalise_reviewer(r)
+                        for r in result["maps"]["slugMap"].keys()
+                    ]
+                )
+        except KeyError:
+            pass
 
     all_reviewers.extend(all_groups)
     found_names.extend(found_groups)
@@ -2085,7 +2237,9 @@ def check_for_invalid_reviewers(reviewers, cwd):
 #
 
 
-def arc_out(args, cwd, stdin=None, log_output_to_console=True):
+def arc_out(
+    args, cwd, stdin=None, log_output_to_console=True, stderr=None, search_error=None
+):
     """arc wrapper that logs output to the console.
 
     Args:
@@ -2095,11 +2249,21 @@ def arc_out(args, cwd, stdin=None, log_output_to_console=True):
             subprocess call.
         log_output_to_console: Defaults to True.  If set to False, don't log the arc
             standard output to the console (stderr prints to console as normal).
+        stderr: Standard error output stream
+        search_error: a list of dicts passed to the check_output to parse the
+            errors in the error response
 
     Returns:
         The list of lines arc printed to the console.
     """
-    arc_output = check_output(config.arc + args, cwd=cwd, split=False, stdin=stdin)
+    arc_output = check_output(
+        ARC + args,
+        cwd=cwd,
+        split=False,
+        stdin=stdin,
+        stderr=stderr,
+        search_error=search_error,
+    )
     if logger.level != logging.DEBUG and log_output_to_console:
         logger.info(arc_output)
     return arc_output
@@ -2122,7 +2286,12 @@ def arc_call_conduit(api_method, api_call_args, cwd):
         logger.debug("Arc stdin: %s", api_call_args)
         with open(args_file, "rb") as temp_f:
             output = arc_out(
-                arc_args, cwd=cwd, stdin=temp_f, log_output_to_console=False
+                arc_args,
+                cwd=cwd,
+                stdin=temp_f,
+                log_output_to_console=False,
+                stderr=subprocess.STDOUT,
+                search_error=ARC_CONDUIT_ERROR,
             )
 
     # We expect arc output to be a JSON. However, in DEBUG mode, a `--trace` is used and
@@ -2157,6 +2326,23 @@ def parse_api_error(api_response):
     response = json.loads(api_response)
     if response["error"] and response["errorMessage"]:
         return response["errorMessage"]
+
+
+def install_arc_if_required():
+    if os.path.exists(ARC_COMMAND) and os.path.exists(LIBPHUTIL_PATH):
+        return
+
+    logger.warning("Installing arc")
+    logger.debug("arc command: %s", ARC_COMMAND)
+    logger.debug("libphutil path: %s", LIBPHUTIL_PATH)
+
+    check_call(["git", "clone", "--depth", "1", ARC_URL, ARC_PATH])
+    check_call(["git", "clone", "--depth", "1", LIBPHUTIL_URL, LIBPHUTIL_PATH])
+
+
+def arc_install_certificate(_):
+    """Calls arc to install the Phabricator's certificate."""
+    check_call([ARC_COMMAND, "install-certificate"])
 
 
 def arc_ping(cwd):
@@ -2326,6 +2512,21 @@ def build_api_call_to_update_commit_title_and_summary(commit):
     return {"transactions": transactions, "objectIdentifier": commit["rev-id"]}
 
 
+def build_transaction_to_update_reviewers(repo_path, commit):
+    # Add reviewers
+    all_reviewers = commit["reviewers"]["request"] + commit["reviewers"]["granted"]
+    # preload all reviewers
+    get_users(repo_path, all_reviewers)
+
+    reviewers = [r for r in all_reviewers if not r.endswith("!")]
+    blocking = [r.rstrip("!") for r in all_reviewers if r.endswith("!")]
+    reviewers_phid = [user["phid"] for user in get_users(repo_path, reviewers)]
+    blocking_phid = [
+        "blocking(%s)" % user["phid"] for user in get_users(repo_path, blocking)
+    ]
+    return [dict(type="reviewers.set", value=reviewers_phid + blocking_phid)]
+
+
 def update_phabricator_commit_summary(commit, repo):
     """Send a new commit summary and description to Phabricator.
 
@@ -2365,7 +2566,7 @@ def update_phabricator_commit_summary(commit, repo):
 
 def submit(repo, args):
     if DEBUG:
-        config.arc.append("--trace")
+        ARC.append("--trace")
 
     repo.before_submit()
 
@@ -2378,12 +2579,13 @@ def submit(repo, args):
     )
 
     # Pre-process to load metadata.
+    morph_blocking_reviewers(commits)
     augment_commits_from_body(commits)
     update_commits_from_args(commits, args)
 
     # Check if arc is configured
     if not repo.check_arc():
-        raise Error("Failed to run %s." % config.arc_command)
+        raise Error("Failed to run %s." % ARC_COMMAND)
 
     # Validate commit stack is suitable for review.
     show_commit_stack(repo, commits, show_warnings=True)
@@ -2426,15 +2628,33 @@ def submit(repo, args):
 
     # Process.
     previous_commit = None
+    # Collect all existing revisions to get reviewers info.
+    rev_ids_to_update = [int(c["rev-id"]) for c in commits if c.get("rev-id")]
+    revisions_to_update = None
+    if rev_ids_to_update:
+        list_to_update = get_revisions(repo.path, ids=rev_ids_to_update)
+        revisions_to_update = {str(r["id"]): r for r in list_to_update}
+
     for commit in commits:
         # Only revisions being updated have an ID.  Newly created ones don't.
         is_update = bool(commit["rev-id"])
+        existing_reviewers = (
+            revisions_to_update[commit["rev-id"]]["attachments"]["reviewers"][
+                "reviewers"
+            ]
+            if commit["rev-id"]
+            else None
+        )
+        has_commit_reviewers = bool(
+            commit["reviewers"]["granted"] + commit["reviewers"]["request"]
+        )
 
         # Let the user know something's happening.
         if is_update:
             logger.info("\nUpdating revision D%s:" % commit["rev-id"])
         else:
             logger.info("\nCreating new revision:")
+
         logger.info("%s %s" % (commit["name"], commit["title-preview"]))
         repo.checkout(commit["node"])
 
@@ -2452,7 +2672,7 @@ def submit(repo, args):
         message = arc_message(template_vars)
 
         # Run arc.
-        with temporary_file(message) as message_file:
+        with temporary_file(message.encode("utf8")) as message_file:
             arc_args = (
                 ["diff"]
                 + ["--base", "arc:this"]
@@ -2463,6 +2683,8 @@ def submit(repo, args):
                 arc_args.append("--nolint")
             if args.wip:
                 arc_args.append("--plan-changes")
+            if args.lesscontext:
+                arc_args.append("--less-context")
             if is_update:
                 message = args.message if args.message else DEFAULT_UPDATE_MESSAGE
                 arc_args.extend(["--message", message] + ["--update", commit["rev-id"]])
@@ -2471,7 +2693,7 @@ def submit(repo, args):
 
             revision_url = None
             for line in check_call_by_line(
-                config.arc + arc_args, cwd=repo.path, never_log=True
+                ARC + arc_args, cwd=repo.path, never_log=True
             ):
                 print(line)
 
@@ -2492,6 +2714,29 @@ def submit(repo, args):
                 )
                 logger.debug(e)
 
+            # Update bug id if different
+            revision = get_revisions(repo.path, ids=[int(commit["rev-id"])])[0]
+            transactions = []
+            if revision["fields"]["bugzilla.bug-id"] != commit["bug-id"]:
+                transactions.append(
+                    dict(type="bugzilla.bug-id", value=commit["bug-id"])
+                )
+
+            # Add reviewers only if revision lacks them
+            if has_commit_reviewers:
+                # Add reviewers only if revision lacks them
+                if not existing_reviewers:
+                    transactions.extend(
+                        build_transaction_to_update_reviewers(repo.path, commit)
+                    )
+
+            if transactions:
+                api_call_args = {
+                    "objectIdentifier": "D%s" % commit["rev-id"],
+                    "transactions": transactions,
+                }
+                arc_call_conduit("differential.revision.edit", api_call_args, repo.path)
+
         # Append/replace div rev url to/in commit description.
         body = amend_revision_url(commit["body"], revision_url)
 
@@ -2511,7 +2756,7 @@ def submit(repo, args):
     repo.refresh_commit_stack(commits)
 
     logger.warning("\nCompleted")
-    show_commit_stack(repo, commits, show_rev_urls=True)
+    show_commit_stack(repo, commits, show_rev_urls=True, submited=True)
 
 
 #
@@ -2552,9 +2797,9 @@ def get_self_release():
 
 
 def update_arc():
-    """Write the las check and update arc."""
+    """Write the last check and update arc."""
     try:
-        check_call(config.arc + ["upgrade"])
+        check_call(ARC + ["upgrade"])
     except subprocess.CalledProcessError:
         logger.warning(
             "arc failed to upgrade, which may be caused by using an arcanist "
@@ -2634,6 +2879,14 @@ def self_update(args):
     logger.info("%s updated" % SELF_FILE)
 
 
+def order_revisions_by_id(phids_by_id, revs, ids):
+    return [revs[phids_by_id[str(id)]] for id in ids if phids_by_id[str(id)]]
+
+
+def order_revisions_by_phid(revs, phids):
+    return [revs[phid] for phid in phids]
+
+
 def get_revisions(cwd, ids=None, phids=None):
     """Get revisions info from Phabricator.
 
@@ -2650,29 +2903,64 @@ def get_revisions(cwd, ids=None, phids=None):
         # Ordering would be too complicated
         raise ValueError("ids and phids are mutually exclusive")
 
-    api_call_args = {"constraints": {}}
+    if not ids and not phids:
+        return []
+
+    collected_ids = (
+        dict(
+            [
+                (str(id), cache.get("rev-id-%s" % id))
+                for id in ids
+                if "rev-id-%s" % id in cache
+            ]
+        )
+        if ids
+        else {}
+    )
+
+    found_phids = collected_ids.values() if ids else phids[:]
+
+    collected_revs = (
+        dict(
+            [
+                (phid, cache.get("rev-%s" % phid))
+                for phid in found_phids
+                if "rev-%s" % phid in cache
+            ]
+        )
+        if found_phids
+        else {}
+    )
+
+    if ids and len(ids) == len(collected_ids):
+        return order_revisions_by_id(collected_ids, collected_revs, ids)
+
+    if phids and len(phids) == len(collected_revs):
+        return order_revisions_by_phid(collected_revs, phids)
+
+    api_call_args = {"constraints": {}, "attachments": {"reviewers": True}}
     if ids:
-        api_call_args["constraints"]["ids"] = ids
+        to_collect = list(set(ids) - set([int(key) for key in collected_ids.keys()]))
+        api_call_args["constraints"]["ids"] = to_collect
     else:
-        api_call_args["constraints"]["phids"] = phids
+        to_collect = list(set(phids) - set(collected_ids.values()))
+        api_call_args["constraints"]["phids"] = to_collect
 
     response = arc_call_conduit("differential.revision.search", api_call_args, cwd)
-    rev_list = response.get("data", [])
+    rev_list = response.get("data")
     if not rev_list:
         return
 
-    # Order by the ids or phids
-    rev_dict_by_id = {}
-    rev_dict_by_phid = {}
-
     for r in rev_list:
-        rev_dict_by_id[r["id"]] = r
-        rev_dict_by_phid[r["phid"]] = r
+        collected_ids[str(r["id"])] = r["phid"]
+        collected_revs[r["phid"]] = r
+        cache.set("rev-id-%s" % r["id"], r["phid"])
+        cache.set("rev-%s" % r["phid"], r)
 
     if ids:
-        return [rev_dict_by_id[i] for i in ids]
+        return order_revisions_by_id(collected_ids, collected_revs, ids)
 
-    return [rev_dict_by_phid[phid] for phid in phids]
+    return order_revisions_by_phid(collected_revs, phids)
 
 
 def get_diffs(cwd, phids):
@@ -2771,11 +3059,11 @@ def patch(repo, args):
     * Error if base commit not found in repository
     """
     if DEBUG:
-        config.arc.append("--trace")
+        ARC.append("--trace")
 
     # Check if arc is configured
     if not repo.check_arc():
-        raise Error("Failed to run %s." % config.arc_command)
+        raise Error("Failed to run %s." % ARC_COMMAND)
 
     # Look for any uncommited changes
     if not args.raw and not repo.is_worktree_clean():
@@ -2792,60 +3080,60 @@ def patch(repo, args):
 
     revision = revs[0]
 
-    # Check if revision is the last in the stack
-    has_child = False
-    try:
-        has_child = has_successor(revision["phid"], repo.path)
-    except NonLinearException:
-        has_child = True
-
-    patch_children = False
-    if has_child:
-        if args.yes or config.always_full_stack:
-            patch_children = True
-        else:
-            res = prompt(
-                "Revision D%s has child(ren). Would you like to patch the full stack?."
-                % rev_id,
-                ["Yes", "No", "Always"],
-            )
-            if res == "Always":
-                config.always_full_stack = True
-                config.write()
-
-            patch_children = res == "Yes" or res == "Always"
-
-    children = []
-    if patch_children:
-        multiple_children = False
+    if not args.skip_dependencies:
+        # Check if revision is the last in the stack
         try:
-            children = get_successor_phids(revision["phid"], repo.path)
+            has_child = has_successor(revision["phid"], repo.path)
         except NonLinearException:
-            multiple_children = True
+            has_child = True
 
-        if multiple_children and not args.yes:
-            res = prompt(
-                "Revision D%s has a non-linear successor graph. "
-                "Unable to detect the full stack. Would you like to continue "
-                "with only part of the stack?" % rev_id,
-                ["Yes", "No"],
-            )
-            if res == "No":
-                return
+        patch_children = False
+        if has_child:
+            if args.yes or config.always_full_stack:
+                patch_children = True
+            else:
+                res = prompt(
+                    "Revision D%s has child(ren).  Would you like to patch the "
+                    "full stack?." % rev_id,
+                    ["Yes", "No", "Always"],
+                )
+                if res == "Always":
+                    config.always_full_stack = True
+                    config.write()
 
-    # Get list of PHIDs in the stack
-    try:
-        phids = get_ancestor_phids(revision["phid"], repo.path)
-    except NonLinearException:
-        raise Error("Non linear dependency detected. Unable to patch the stack.")
+                patch_children = res == "Yes" or res == "Always"
 
-    # Pull revisions data
-    if phids:
-        revs.extend(get_revisions(repo.path, phids=phids))
-        revs.reverse()
+        children = []
+        if patch_children:
+            multiple_children = False
+            try:
+                children = get_successor_phids(revision["phid"], repo.path)
+            except NonLinearException:
+                multiple_children = True
 
-    if children:
-        revs.extend(get_revisions(repo.path, phids=children))
+            if multiple_children and not args.yes:
+                res = prompt(
+                    "Revision D%s has a non-linear successor graph. "
+                    "Unable to detect the full stack. Would you like to continue "
+                    "with only part of the stack?" % rev_id,
+                    ["Yes", "No"],
+                )
+                if res == "No":
+                    return
+
+        # Get list of PHIDs in the stack
+        try:
+            phids = get_ancestor_phids(revision["phid"], repo.path)
+        except NonLinearException:
+            raise Error("Non linear dependency detected. Unable to patch the stack.")
+
+        # Pull revisions data
+        if phids:
+            revs.extend(get_revisions(repo.path, phids=phids))
+            revs.reverse()
+
+        if children:
+            revs.extend(get_revisions(repo.path, phids=children))
 
     # Set the target id
     rev_id = revs[-1]["id"]
@@ -2924,13 +3212,23 @@ def patch(repo, args):
                 diff_commits[0]["author"]["email"],
             )
             author_date = datetime.datetime.fromtimestamp(
-                diff_commits[0]["author"]["epoch"]
+                diff["fields"]["dateCreated"]
             ).isoformat()
 
             try:
                 repo.apply_patch(raw, body, author, author_date)
             except subprocess.CalledProcessError:
                 raise Error("Patch failed to apply")
+
+
+def arc_pass(args):
+    if DEBUG:
+        ARC.append("--trace")
+
+    try:
+        check_call(ARC + args.commands)
+    except subprocess.CalledProcessError:
+        pass
 
 
 #
@@ -2957,8 +3255,19 @@ class ColourFormatter(logging.Formatter):
 def init_logging():
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(ColourFormatter())
+    stdout_handler.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     logger.addHandler(stdout_handler)
-    logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        filename=LOG_FILE, when="midnight", backupCount=7
+    )
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)-13s %(levelname)-8s %(message)s")
+    )
+    file_handler.setLevel(logging.DEBUG)
+    logger.addHandler(file_handler)
+
+    logger.setLevel(logging.DEBUG)
 
 
 def parse_args(argv):
@@ -3035,6 +3344,19 @@ def parse_args(argv):
         "--plan-changes",
         action="store_true",
         help="Create or update a revision without requesting a code review",
+    )
+    submit_parser.add_argument(
+        "--less-context",
+        "--lesscontext",
+        action="store_true",
+        dest="lesscontext",
+        help=(
+            "Normally, files are diffed with full context: the entire file "
+            "is sent to Phabricator so reviewers can 'show more' and see "
+            "it. If you are making changes to very large files with tens of "
+            "thousands of lines, this may not work well. With this flag, a "
+            "revision will be created that has only a few lines of context."
+        ),
     )
     submit_parser.add_argument(
         "--no-stack",
@@ -3119,6 +3441,11 @@ def parse_args(argv):
         help="(Git only) Do not create the branch",
     )
     patch_parser.add_argument(
+        "--skip-dependencies",
+        action="store_true",
+        help="Do not search for dependencies. Patch only one revision.",
+    )
+    patch_parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
@@ -3132,10 +3459,23 @@ def parse_args(argv):
     )
     patch_parser.set_defaults(func=patch, needs_repo=True)
 
+    # install-certificate
+
+    cert_parser = commands.add_parser(
+        "install-certificate", help="Install Phabricator certificate locally"
+    )
+    cert_parser.set_defaults(func=arc_install_certificate, needs_repo=False)
+
+    # arc
+
+    arc_parser = commands.add_parser("arc", help="Call Arcanist")
+    arc_parser.add_argument("commands", type=str, nargs=argparse.REMAINDER)
+    arc_parser.set_defaults(func=arc_pass, needs_repo=False)
+
     # if we're called without a command and from within a repository, default to submit.
     if not argv or (
         not (set(argv) & {"-h", "--help"})
-        and argv[0] not in ["submit", "self-update", "patch"]
+        and argv[0] not in [choice for choice in commands.choices]
         and find_repo_root(os.getcwd())
     ):
         logger.debug("defaulting to `submit`")
@@ -3147,21 +3487,19 @@ def parse_args(argv):
 def main(argv):
     global config, HAS_ANSI, DEBUG
     try:
+        if not os.path.exists(MOZBUILD_PATH):
+            os.makedirs(MOZBUILD_PATH)
+
         init_logging()
         config = Config()
 
         if config.no_ansi:
             HAS_ANSI = False
 
-        arc_path = which_path(config.arc_command)
-        if not arc_path:
-            raise Error(
-                "Failed to find '%s' on the system path.\n"
-                "Please follow the Phabricator setup guide:\n"
-                "%s" % (config.arc_command, GUIDE_URL)
-            )
+        if not which_path(GIT_COMMAND[0]):
+            raise Error("Failed to find 'git' executable")
 
-        config.arc = [arc_path]
+        install_arc_if_required()
 
         # Ensure ssl certificates are validated (see PEP 476).
         if hasattr(ssl, "_https_verify_certificates"):

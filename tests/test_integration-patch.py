@@ -277,33 +277,33 @@ def test_hg_patch_with_commit(
 REV_1 = dict(
     id=1,
     phid="PHID-REV-1",
-    fields=dict(title="title R1", summary="", diffPHID="PHID-DIFF-1"),
+    fields=dict(title="title R1", summary=u"\u0105", diffPHID="PHID-DIFF-1"),
 )
 
 REV_2 = dict(
     id=2,
     phid="PHID-REV-2",
-    fields=dict(title="title R2", summary="", diffPHID="PHID-DIFF-2"),
+    fields=dict(title="title R2", summary=u"\u0105", diffPHID="PHID-DIFF-2"),
 )
 
 REV_BIN = dict(
     id=3,
     phid="PHID-REV-3",
-    fields=dict(title="title BIN", summary="", diffPHID="PHID-DIFF-3"),
+    fields=dict(title="title BIN", summary=u"\u0105", diffPHID="PHID-DIFF-3"),
 )
 ATTACHMENTS = dict(
     commits=dict(
-        commits=[
-            dict(author=dict(name="user", email="author@example.com", epoch=1547806078))
-        ]
+        commits=[dict(author=dict(name="user", email="author@example.com", epoch=None))]
     )
 )
 
 DIFF_1 = dict(
-    fields=dict(refs=[dict(identifier="0", type="base")]), id=1, attachments=ATTACHMENTS
+    fields=dict(dateCreated=1547806078, refs=[dict(identifier="0", type="base")]),
+    id=1,
+    attachments=ATTACHMENTS,
 )
 
-DIFF_2 = dict(fields=dict(), id=2, attachments=ATTACHMENTS)
+DIFF_2 = dict(fields=dict(dateCreated=1547806078), id=2, attachments=ATTACHMENTS)
 
 PATCH_1 = """\
 diff --git a/X b/X

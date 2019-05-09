@@ -43,8 +43,8 @@ no_ansi = False
 [vcs]
 safe_mode = False
 
-[arc]
-arc_command = arc
+[git]
+remote =
 
 [submit]
 auto_submit = False
@@ -57,14 +57,15 @@ create_bookmark = True
 always_full_stack = False
 
 [updater]
-self_last_check = <time>
-arc_last_check = <time>
+self_last_check = 
+arc_last_check = 
 ```
 
 - `ui.no_ansi` : never use ANSI colours (default: auto-detected).
 - `vcs.safe_mode` : use only safe VCS settings (default: false). Use `--safe-mode` option to switch it on for a one-time usage.
-- `arc.arc_command` : command to use when calling the Arcanist CLI.
-    (default: "arc")
+- `git.remote`: comma separated string. Default remotes used to find the first
+    unpublished commit. Default, empty string, means that a list of remotes will
+    be read from `git remote` command.
 - `submit.auto_submit` : when true the confirmation prompt will be skipped
     (default: false).
 - `submit.always_blocking` : when true reviewers in commit descriptions will be marked
@@ -97,7 +98,7 @@ To get information about all available commands run
   $ moz-phab -h
 ```
 
-All commands involving VCS (like `submit` and `patch`) might be used with a 
+All commands involving VCS (like `submit` and `patch`) might be used with a
 `--safe-mode` switch. It will run the VCS command with only chosen set of extensions.
 
 ### Submiting commits to the Phabricator
@@ -150,7 +151,7 @@ Note that if you do not have Python in your path, you will need to run
 
 ### Downloading a patch from the Phabricator
 
-moz-phab patch allows patching an entire stack of revisions. The simplest 
+`moz-phab patch` allows patching an entire stack of revisions. The simplest
 invocation is
 
 ```
@@ -186,6 +187,18 @@ This behavior can be modified with few options:
     commits will be added just on top of the *base commit* which might result
     in switching the repository to the 'detached HEAD' state.
 
+- `--skip-dependencies` : patch only one revision, ignore dependencies.
+
+### Running arc commands
+
+`moz-phab arc` allows running Arcanist commands indirectly:
+
+```
+$ moz-phab arc ARG [ARG ...]
+```
+
+`arc land --preview` will become `moz-phab arc land --preview`.
+
 ## Reporting Issues
 
 We use [Bugzilla](https://bugzilla.mozilla.org/) to track development.
@@ -206,3 +219,5 @@ and `patch` commands.
 
 All python code must be formatted with [black](https://github.com/ambv/black)
 using the default settings.
+
+Pull Requests are not accepted here; please submit changes with Phabricator.
