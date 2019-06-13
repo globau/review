@@ -903,26 +903,19 @@ class Repository(object):
         Raises:
             ConduitAPIError if the API threw an error back at us.
         """
-        api_call_params = json_args_to_query_params(api_call_args)
-        api_call_params.append(("api.token", self.load_api_token()))
-
         url = urlparse.urljoin(self.api_url, api_method)
-
-        if DEBUG:
-            logger.debug("Calling Conduit API {}".format(url))
-
-        req = urllib2.Request(url)
+        logger.debug("%s %s" % (url, api_call_args))
 
         # Manually concatenate query parameters because Conduit doesn't accept
         # URL encoded parameter names.
+        api_call_args = api_call_args.copy()
+        api_call_args["api.token"] = self.load_api_token()
+        api_call_params = json_args_to_query_params(api_call_args)
         data = "&".join(
             ["{}={}".format(k, urllib2.quote(v)) for (k, v) in api_call_params]
         )
 
-        req.add_data(data)
-
-        output = urllib2.urlopen(req, timeout=30).read()
-
+        output = urllib2.urlopen(urllib2.Request(url, data=data), timeout=30).read()
         response = json.loads(output)
 
         if response["error_code"] and response["error_info"]:
@@ -3137,7 +3130,7 @@ def get_revisions(repo, ids=None, phids=None):
         phids_by_id = {}
         found_phids = phids[:]
         query_field = "phids"
-        query_values = list(set(phids) - set(phids_by_id.values()))
+        query_values = set([phid for phid in phids if "rev-%s" % phid not in cache])
 
     # Revisions metadata keyed by PHID.
     revisions = dict(
@@ -3151,7 +3144,7 @@ def get_revisions(repo, ids=None, phids=None):
     # Query Phabricator if we don't have cached values for revisions.
     if query_values:
         api_call_args = {
-            "constraints": {query_field: query_values},
+            "constraints": {query_field: sorted(query_values)},
             "attachments": {"reviewers": True},
         }
         response = repo.call_conduit("differential.revision.search", api_call_args)
@@ -3202,35 +3195,41 @@ def get_base_ref(diff):
             return ref["identifier"]
 
 
-def get_successor_phids(phid, repo):
-    return get_related_phids(phid, None, repo, relation="child")
+def get_successor_phids(phid, repo, include_abandoned=False):
+    return get_related_phids(
+        phid, repo, relation="child", include_abandoned=include_abandoned
+    )
 
 
-def get_ancestor_phids(phid, repo):
-    return get_related_phids(phid, None, repo, relation="parent")
+def get_ancestor_phids(phid, repo, include_abandoned=False):
+    return get_related_phids(
+        phid, repo, relation="parent", include_abandoned=include_abandoned
+    )
 
 
-def get_related_phids(phid, related, repo, relation="parent", proceed=True):
-    """Returns the list of PHIDs with direct dependency"""
-    if not related:
-        related = []
+def get_related_phids(base_phid, repo, relation="parent", include_abandoned=False):
+    """Returns the full list of all PHIDs matching the provided relationship."""
+    result = []
 
-    api_call_args = {"sourcePHIDs": [phid], "types": ["revision.%s" % relation]}
-    edge = repo.call_conduit("edge.search", api_call_args)
-    if edge.get("data"):
-        if len(edge["data"]) > 1:
-            raise NonLinearException()
+    def _get_related(phid):
+        api_call_args = {"sourcePHIDs": [phid], "types": ["revision.%s" % relation]}
+        edge = repo.call_conduit("edge.search", api_call_args)
+        if edge.get("data"):
+            if len(edge["data"]) > 1:
+                raise NonLinearException()
 
-        dep_phid = edge["data"][0]["destinationPHID"]
-        grand = (
-            get_related_phids(dep_phid, related, repo, relation=relation)
-            if proceed
-            else []
-        )
-        related.append(dep_phid)
-        related.extend(grand)
+            result.append(edge["data"][0]["destinationPHID"])
+            _get_related(result[-1])
 
-    return related
+    _get_related(base_phid)
+
+    if not result or include_abandoned:
+        return result
+
+    revisions = get_revisions(repo, phids=result)
+    return [
+        r["phid"] for r in revisions if r["fields"]["status"]["value"] != "abandoned"
+    ]
 
 
 def patch(repo, args):
@@ -3281,7 +3280,9 @@ def patch(repo, args):
     if not args.skip_dependencies:
         with wait_message("Fetching D%s children.." % rev_id):
             try:
-                children = get_successor_phids(revision["phid"], repo)
+                children = get_successor_phids(
+                    revision["phid"], repo, include_abandoned=args.include_abandoned
+                )
                 non_linear = False
             except NonLinearException:
                 children = []
@@ -3666,7 +3667,10 @@ def parse_args(argv):
     patch_parser.add_argument(
         "--skip-dependencies",
         action="store_true",
-        help="Do not search for dependencies. Patch only one revision.",
+        help="Do not search for dependencies; patch only one revision",
+    )
+    patch_parser.add_argument(
+        "--include-abandoned", action="store_true", help="Apply abandoned revisions"
     )
     patch_parser.add_argument(
         "--yes",

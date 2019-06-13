@@ -135,31 +135,34 @@ def test_get_diffs(call_conduit):
 
 @mock.patch("mozphab.Repository.call_conduit")
 def test_get_related_phids(call_conduit):
-    get_phids = mozphab.get_related_phids
+    get_related_phids = mozphab.get_related_phids
+    repo = mozphab.Repository(None, None, "dummy")
 
     call_conduit.return_value = {}
-
-    repo = mozphab.Repository(None, None, "dummy")
-    assert [] == get_phids("aaa", None, repo)
+    assert [] == get_related_phids("aaa", repo, include_abandoned=True)
     call_conduit.assert_called_once_with(
         "edge.search", {"sourcePHIDs": ["aaa"], "types": ["revision.parent"]}
     )
 
-    assert ["bbb"] == get_phids("aaa", ["bbb"], repo)
+    call_conduit.side_effect = [
+        dict(data=[dict(destinationPHID="bbb")]),
+        dict(data=[dict(destinationPHID="aaa")]),
+        {},
+    ]
+    assert ["bbb", "aaa"] == get_related_phids("ccc", repo, include_abandoned=True)
 
     call_conduit.side_effect = [
         dict(data=[dict(destinationPHID="bbb")]),
         dict(data=[dict(destinationPHID="aaa")]),
-        dict(),
+        {},
+        dict(
+            data=[
+                dict(id=1, phid="aaa", fields=dict(status=dict(value="-"))),
+                dict(id=2, phid="bbb", fields=dict(status=dict(value="abandoned"))),
+            ]
+        ),
     ]
-    assert ["bbb", "aaa"] == get_phids("ccc", None, repo)
-
-    call_conduit.side_effect = [
-        dict(data=[dict(destinationPHID="bbb")]),
-        dict(data=[dict(destinationPHID="aaa")]),
-        dict(),
-    ]
-    assert ["bbb"] == get_phids("ccc", None, repo, proceed=False)
+    assert ["aaa"] == get_related_phids("ccc", repo, include_abandoned=False)
 
 
 @mock.patch("mozphab.check_call")
@@ -225,6 +228,7 @@ def test_patch(
             apply_to="base",
             yes=False,
             skip_dependencies=False,
+            include_abandoned=False,
         ):
             self.rev_id = rev_id
             self.no_commit = no_commit
@@ -232,6 +236,7 @@ def test_patch(
             self.apply_to = apply_to
             self.yes = yes
             self.skip_dependencies = skip_dependencies
+            self.include_abandoned = include_abandoned
 
     m_git_check_conduit.return_value = True
     m_git_is_worktree_clean.return_value = False
