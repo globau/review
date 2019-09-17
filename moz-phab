@@ -15,6 +15,7 @@ Goals:
 """
 
 import argparse
+import base64
 import calendar
 import ConfigParser
 import datetime
@@ -23,6 +24,7 @@ import io
 import json
 import logging
 import logging.handlers
+import mimetypes
 import os
 import re
 import signal
@@ -34,9 +36,11 @@ import tempfile
 import threading
 import time
 import traceback
+import unicodedata
 import urllib2
 import urlparse
 import uuid
+from collections import namedtuple
 from contextlib import contextmanager
 from distutils.version import LooseVersion
 from glob import glob
@@ -69,7 +73,8 @@ HAS_ANSI = (
     )
 )
 SELF_FILE = os.getenv("UPDATE_FILE") if os.getenv("UPDATE_FILE") else __file__
-SHOW_SPINNER = True
+# Switched off temporarily due to https://bugzilla.mozilla.org/show_bug.cgi?id=1565502
+SHOW_SPINNER = False
 
 # Constants and Globals
 
@@ -178,6 +183,11 @@ BLOCKING_REVIEWERS_RE = re.compile(r"\b(r!)([" + IRC_NICK_CHARS + ",]+)")
 DEPENDS_ON_RE = re.compile(r"^\s*Depends on\s*D(\d+)\s*$", flags=re.MULTILINE)
 
 MINIMUM_MERCURIAL_VERSION = LooseVersion("4.3.3")
+
+MAX_TEXT_SIZE = 10 * 1024 * 1024
+MAX_CONTEXT_SIZE = 4 * 1024 * 1024
+
+NULL_SHA1 = "0" * 40
 
 #
 # Utilities
@@ -302,6 +312,7 @@ def check_output(
     stderr=None,
     env=None,
     search_error=None,
+    expect_binary=False,
 ):
     # wrapper around subprocess.check_output with debug output and splitting
     logger.debug("$ %s" % " ".join(shell_quote(s) for s in command))
@@ -321,6 +332,10 @@ def check_output(
         raise CommandError(
             "command '%s' failed to complete successfully" % command[0], e.returncode
         )
+
+    if expect_binary:
+        logger.debug("%s bytes of data received" % len(output))
+        return output
 
     output = output.decode("utf8")
 
@@ -354,21 +369,29 @@ def read_json_field(files, field_path):
     return None
 
 
-def prompt(question, options):
+def prompt(question, options=None):
     if HAS_ANSI:
         question = "\033[33m%s\033[0m" % question
-    prompt_options = list(options)
-    prompt_options[0] = prompt_options[0].upper()
-    prompt_str = "%s (%s)? " % (question, "/".join(prompt_options))
+    prompt_str = question
+    if options:
+        prompt_options = list(options)
+        prompt_options[0] = prompt_options[0].upper()
+        prompt_str = "%s (%s)? " % (question, "/".join(prompt_options))
 
-    options_map = {o[0].lower(): o for o in options}
-    options_map[""] = options[0]
+        options_map = {o[0].lower(): o for o in options}
+        options_map[""] = options[0]
+
     while True:
         res = raw_input(prompt_str)
-        if len(res) > 1:
-            res = res[0].lower()
         if res == chr(27):  # escape
             sys.exit(1)
+
+        if not options:
+            return res
+
+        if len(res) > 1:
+            res = res[0].lower()
+
         if res in options_map:
             return options_map[res]
 
@@ -638,6 +661,8 @@ def json_args_to_query_params(args):
         elif type(v) == dict:
             for (k, val) in v.iteritems():
                 convert("{}[{}]".format(path, k), val)
+        elif type(v) == unicode:
+            params.append((path, v))
         else:
             params.append((path, str(v)))
 
@@ -649,25 +674,45 @@ def json_args_to_query_params(args):
 
 class ConduitAPI:
     def __init__(self):
-        self.api_url = None
-        self.dot_path = None
-        self.phab_url = None
+        self.repo = None
 
-    def set_args_from_repo(self, repo):
-        self.api_url = repo.api_url
-        self.dot_path = repo.dot_path
-        self.phab_url = repo.phab_url
+    def set_repo(self, repo):
+        self.repo = repo
+
+    @property
+    def repo_phid(self):
+        return self.repo.phid
 
     def load_api_token(self):
-        """Return a API Token for given repository.
+        """Return an API Token for the given repository.
 
         Returns:
             API Token string
         """
-        token = read_json_field([get_arcrc_path()], ["hosts", self.api_url, "token"])
+        token = read_json_field(
+            [get_arcrc_path()], ["hosts", self.repo.api_url, "token"]
+        )
         if not token:
             raise ConduitAPIError(INSTALL_CERT_MSG)
         return token
+
+    def save_api_token(self, token):
+        filename = get_arcrc_path()
+        try:
+            with open(filename, "r") as f:
+                rc = json.load(f)
+        except IOError as e:
+            if e.errno != errno.ENOENT:
+                raise
+
+            rc = {}
+
+        rc.setdefault("hosts", {})
+        rc["hosts"].setdefault(self.repo.api_url, {})
+        rc["hosts"][self.repo.api_url]["token"] = token
+
+        with open(filename, "w") as f:
+            json.dump(rc, f, sort_keys=True, indent=2)
 
     def call(self, api_method, api_call_args):
         """Call Conduit API and return the JSON API call result.
@@ -682,8 +727,11 @@ class ConduitAPI:
         Raises:
             ConduitAPIError if the API threw an error back at us.
         """
-        url = urlparse.urljoin(self.api_url, api_method)
+        url = urlparse.urljoin(self.repo.api_url, api_method)
         logger.debug("%s %s" % (url, api_call_args))
+
+        api_call_params = json_args_to_query_params(api_call_args)
+        api_call_params.append(("api.token", self.load_api_token()))
 
         # Manually concatenate query parameters because Conduit doesn't accept
         # URL encoded parameter names.
@@ -691,7 +739,10 @@ class ConduitAPI:
         api_call_args["api.token"] = self.load_api_token()
         api_call_params = json_args_to_query_params(api_call_args)
         data = "&".join(
-            ["{}={}".format(k, urllib2.quote(v)) for (k, v) in api_call_params]
+            [
+                "{}={}".format(k, urllib2.quote(v.encode("utf8")))
+                for (k, v) in api_call_params
+            ]
         )
 
         output = urllib2.urlopen(urllib2.Request(url, data=data), timeout=30).read()
@@ -719,7 +770,7 @@ class ConduitAPI:
     def check(self):
         """Check if raw Conduit API can be used."""
         # Check if the cache file exists
-        path = os.path.join(self.dot_path, ".moz-phab_conduit-configured")
+        path = os.path.join(self.repo.dot_path, ".moz-phab_conduit-configured")
         if os.path.isfile(path):
             return True
 
@@ -791,8 +842,11 @@ class ConduitAPI:
 
         # Return revisions in the same order requested.
         if ids:
+            # Skip revisions for which we do not have a query result.
             return [
-                revisions[phids_by_id[rev_id]] for rev_id in ids if phids_by_id[rev_id]
+                revisions[phids_by_id[rev_id]]
+                for rev_id in ids
+                if rev_id in phids_by_id
             ]
         else:
             return [revisions[phid] for phid in phids]
@@ -817,42 +871,6 @@ class ConduitAPI:
             diff_dict[d["phid"]] = d
 
         return diff_dict
-
-    def update_phabricator_commit_summary(self, commit):
-        """Send a new commit summary and description to Phabricator.
-
-        Args:
-            commit: A VCS commit data dict to use for the call args.
-
-        """
-        # From https://phabricator.services.mozilla.com/api/differential.revision.edit
-        #
-        # Example call format we are aiming for:
-        #
-        # $ echo '{
-        #   "transactions": [
-        #     {
-        #       "type": "title",
-        #       "value": "Remove unnecessary branch statement"
-        #     }
-        #     {
-        #       "type": "summary",
-        #       "value": "Blah"
-        #     }
-        #   ],
-        #   "objectIdentifier": "D8095"
-        # }' | arc call-conduit \
-        #       --conduit-uri https://phabricator.services.mozilla.com/ \
-        #       --conduit-token <conduit-token> differential.revision.edit
-        logger.debug("updating revision title and summary in Phabricator")
-        api_call_args = build_api_call_to_update_commit_title_and_summary(commit)
-        try:
-            self.call("differential.revision.edit", api_call_args)
-        except (ConduitAPIError, CommandError) as err:
-            logger.warn(
-                "Error attempting to update revision summary and title in Phabricator"
-            )
-            logger.warn("Error was: %s", err)
 
     def get_successor_phids(self, phid, include_abandoned=False):
         return self.get_related_phids(
@@ -922,8 +940,412 @@ class ConduitAPI:
 
         return users
 
+    def get_groups(self, slugs):
+        to_collect = []
+        groups = []
+        for slug in slugs:
+            s = slug.rstrip("!")
+            key = "group-%s" % s
+            if key in cache:
+                groups.append(cache.get(key))
+            else:
+                to_collect.append(s)
+
+        if not to_collect:
+            return groups
+
+        # See https://phabricator.services.mozilla.com/conduit/method/project.search/
+        api_call_args = {"queryKey": "active", "constraints": {"slugs": to_collect}}
+        response = self.call("project.search", api_call_args)
+        for data in response.get("data"):
+            group = dict(name=data["fields"]["slug"], phid=data["phid"])
+            groups.append(group)
+            key = "group-%s" % group["name"]
+            cache.set(key, group)
+
+        # projects might be received by an alias.
+        maps = response["maps"]["slugMap"]
+        for alias in maps.keys():
+            name = normalise_reviewer(alias)
+            group = dict(name=name, phid=maps[alias]["projectPHID"])
+            key = "group-%s" % alias
+            if key not in cache:
+                groups.append(group)
+                cache.set(key, group)
+
+        return groups
+
+    def create_revision(
+        self, commit, title, summary, diff_phid, has_commit_reviewers, wip=False
+    ):
+        """Create a new revision in Phabricator."""
+        transactions = [
+            dict(type="title", value=title),
+            dict(type="summary", value=summary),
+        ]
+        if has_commit_reviewers and not wip:
+            update_revision_reviewers(transactions, commit)
+
+        transactions.append(dict(type="bugzilla.bug-id", value=commit["bug-id"]))
+        return self.edit_revision(
+            transactions=transactions, diff_phid=diff_phid, wip=wip
+        )
+
+    def update_revision(
+        self,
+        commit,
+        has_commit_reviewers,
+        existing_reviewers,
+        diff_phid=None,
+        wip=False,
+        comment=None,
+    ):
+        """Update an existing revision in Phabricator."""
+        # Update the title and summary
+        transactions = [
+            dict(type="title", value=commit["title"]),
+            dict(type="summary", value=strip_differential_revision(commit["body"])),
+        ]
+
+        # Add update comment
+        if comment:
+            transactions.append(dict(type="comment", value=comment))
+
+        # Add reviewers only if revision lacks them
+        if has_commit_reviewers and not wip:
+            if not existing_reviewers:
+                update_revision_reviewers(transactions, commit)
+
+        # Update bug id if different
+        revision = conduit.get_revisions(ids=[int(commit["rev-id"])])[0]
+        if revision["fields"]["bugzilla.bug-id"] != commit["bug-id"]:
+            transactions.append(dict(type="bugzilla.bug-id", value=commit["bug-id"]))
+
+        return self.edit_revision(
+            transactions=transactions,
+            diff_phid=diff_phid,
+            rev_id=commit["rev-id"],
+            wip=wip,
+        )
+
+    def edit_revision(
+        self, transactions=[], diff_phid=None, rev_id=None, wip=False, force_wip=False
+    ):
+        """Edit (create or update) a revision."""
+        trans = list(transactions)
+        # diff_phid is not present for changes in revision settings (like WIP)
+        if diff_phid:
+            trans.append(dict(type="update", value=diff_phid))
+
+        if wip:
+            set_wip_later = False
+            if rev_id and not force_wip:
+                # Set "changes planned" in a new request called after the update one.
+                # Phab API validation would return with an error if "changes planned
+                # would be set in the first API call.
+                existing_revision = conduit.get_revisions(ids=[int(rev_id)])[0]
+                set_wip_later = (
+                    existing_revision["fields"]["status"]["value"] == "changes-planned"
+                )
+
+        if force_wip or wip and not set_wip_later:
+            trans.append(dict(type="plan-changes", value="true"))
+
+        api_call_args = dict(transactions=trans)
+
+        if rev_id:
+            api_call_args["objectIdentifier"] = rev_id
+
+        revision = self.call("differential.revision.edit", api_call_args)
+        if not revision:
+            raise ConduitAPIError("Can't edit the revision.")
+
+        if wip and set_wip_later:
+            return self.edit_revision(rev_id=rev_id, force_wip=True)
+
+        return revision
+
+    def get_repository(self, call_sign):
+        """Get the repository info from Phabricator."""
+        key = "repo-%s" % call_sign
+        if key in cache:
+            return cache.get(key)
+
+        api_call_args = dict(constraints=dict(callsigns=[call_sign]), limit=1)
+        data = self.call("diffusion.repository.search", api_call_args)
+        if not data.get("data"):
+            raise NotFoundError("Repository %s not found" % call_sign)
+
+        repo = data["data"][0]
+        cache.set(key, repo)
+        return repo
+
+    def create_diff(self, changes, base_revision):
+        api_call_args = dict(
+            changes=changes,
+            sourceMachine=self.repo.phab_url,
+            sourceControlSystem=self.repo.phab_vcs,
+            sourceControlPath="/",
+            sourceControlBaseRevision=base_revision,
+            creationMethod="moz-phab",
+            lintStatus="none",
+            unitStatus="none",
+            repositoryPHID=self.repo.phid,
+            sourcePath=self.repo.path,
+            branch="HEAD",
+        )
+        return self.call("differential.creatediff", api_call_args)
+
+    def set_diff_property(self, diff_id, commit, message):
+        api_call_args = dict(
+            diff_id=diff_id,
+            name="local:commits",
+            data=json.dumps(
+                {
+                    commit["node"]: {
+                        "author": commit["author-name"],
+                        "authorEmail": commit["author-email"],
+                        "time": 0,
+                        "summary": commit["title-preview"],
+                        "message": message,
+                        "commit": conduit.repo.get_public_node(commit["node"]),
+                        "tree": commit["tree-hash"],
+                        "parents": [conduit.repo.get_public_node(commit["parent"])],
+                    }
+                }
+            ),
+        )
+        self.call("differential.setdiffproperty", api_call_args)
+
+    def file_upload(self, data):
+        data_base64 = base64.standard_b64encode(data)
+        return self.call("file.upload", dict(data_base64=data_base64.decode()))
+
+    def whoami(self):
+        if "whoami" in cache:
+            return cache.get("whoami")
+
+        who = self.call("user.whoami", {})
+        cache.set("whoami", who)
+        return who
+
 
 conduit = ConduitAPI()
+
+
+#
+# Diff
+#
+
+
+class Diff:
+    """Representation of the Diff used to submit to the Phabricator."""
+
+    Hunk = namedtuple(
+        "Hunk",
+        [
+            "old_off",
+            "old_len",
+            "new_off",
+            "new_len",
+            "old_eof_newline",
+            "new_eof_newline",
+            "added",
+            "deleted",
+            "corpus",
+        ],
+    )
+
+    class Change:
+        def __init__(self, path):
+            self.old_mode = None
+            self.cur_mode = None
+            self.old_path = None
+            self.cur_path = path
+            self.away_paths = []
+            self.kind = Diff.Kind("CHANGE")
+            self.binary = False
+            self.file_type = Diff.FileType("TEXT")
+            self.uploads = []
+            self.hunks = []
+
+        @property
+        def added(self):
+            return sum(hunk.added for hunk in self.hunks)
+
+        @property
+        def deleted(self):
+            return sum(hunk.deleted for hunk in self.hunks)
+
+        def to_conduit(self, node):
+            # Record upload information
+            metadata = {}
+            for upload in self.uploads:
+                metadata["%s:binary-phid" % upload["type"]] = upload["phid"]
+                metadata["%s:file:size" % upload["type"]] = len(upload["value"])
+                metadata["%s:file:mime-type" % upload["type"]] = upload["mime"]
+
+            # Translate hunks
+            hunks = [
+                {
+                    "oldOffset": hunk.old_off,
+                    "oldLength": hunk.old_len,
+                    "newOffset": hunk.new_off,
+                    "newLength": hunk.new_len,
+                    "addLines": hunk.added,
+                    "delLines": hunk.deleted,
+                    "isMissingOldNewline": not hunk.old_eof_newline,
+                    "isMissingNewNewline": not hunk.new_eof_newline,
+                    "corpus": hunk.corpus,
+                }
+                for hunk in self.hunks
+            ]
+
+            old_props = {"unix:filemode": self.old_mode} if self.old_mode else {}
+            cur_props = {"unix:filemode": self.cur_mode} if self.cur_mode else {}
+
+            return {
+                "metadata": metadata,
+                "oldPath": self.old_path,
+                "currentPath": self.cur_path,
+                "awayPaths": self.away_paths,
+                "oldProperties": old_props,
+                "newProperties": cur_props,
+                "commitHash": node,
+                "type": self.kind.value,
+                "fileType": self.file_type.value,
+                "hunks": hunks,
+            }
+
+    class Kind:
+        values = dict(
+            ADD=1,
+            CHANGE=2,
+            DELETE=3,
+            MOVE_AWAY=4,
+            COPY_AWAY=5,
+            MOVE_HERE=6,
+            COPY_HERE=7,
+            MULTICOPY=8,
+        )
+
+        def __init__(self, name):
+            self.value = self.values[name]
+            self.name = name
+
+        def short(self):
+            if self.name == "ADD":
+                return "A "
+            elif self.name == "CHANGE":
+                return "M "
+            elif self.name == "DELETE":
+                return "D "
+            elif self.name == "MOVE_AWAY":
+                return "R>"
+            elif self.name == "MOVE_HERE":
+                return ">R"
+            elif self.name == "COPY_AWAY":
+                return "C>"
+            elif self.name == "COPY_HERE":
+                return ">C"
+            elif self.name == "MULTICOPY":
+                return "C*"
+
+    class FileType:
+        values = dict(
+            TEXT=1,
+            IMAGE=2,
+            BINARY=3,
+            DIRECTORY=4,  # Should never show up...
+            SYMLINK=5,  # Support symlinks (do we care?)
+            DELETED=6,
+            NORMAL=7,
+        )
+
+        def __init__(self, name):
+            self.value = self.values[name]
+            self.name = name
+
+    def __init__(self):
+        # self.commit = commit
+        self.changes = {}
+        self.phid = None
+
+    def change_for(self, path):
+        if path not in self.changes:
+            self.changes[path] = self.Change(path)
+        return self.changes[path]
+
+    def set_change_kind(self, change, kind, a_mode, b_mode, a_path, b_path):
+        """Determine the correct kind from the letter."""
+        if kind == "A":
+            change.kind = self.Kind("ADD")
+            change.cur_mode = b_mode
+
+        elif kind == "D":
+            change.kind = self.Kind("DELETE")
+            change.old_mode = a_mode
+            change.old_path = a_path
+
+        elif kind == "M":
+            change.kind = self.Kind("CHANGE")
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.cur_mode = b_mode
+            change.old_path = a_path
+            assert change.old_path == change.cur_path
+
+        elif kind == "R":
+            change.kind = self.Kind("MOVE_HERE")
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.cur_mode = b_mode
+
+            change.old_path = a_path
+            old = self.change_for(change.old_path)
+            if old.kind.name in ["MOVE_AWAY", "COPY_AWAY"]:
+                old.kind = self.Kind("MULTICOPY")
+            elif old.kind.name != "MULTICOPY":
+                old.kind = self.Kind("MOVE_AWAY")
+            old.away_paths.append(change.cur_path)
+
+        elif kind == "C":
+            change.kind = self.Kind("COPY_HERE")
+            if a_mode != b_mode:
+                change.old_mode = a_mode
+                change.cur_mode = b_mode
+
+            change.old_path = a_path
+            old = self.change_for(change.old_path)
+            if old.kind.name == "MOVE_AWAY":
+                old.kind = self.Kind("MULTICOPY")
+            else:
+                old.kind.name = self.Kind("COPY_AWAY")
+            old.away_paths.append(change.cur_path)
+
+        else:
+            raise "unsupported change type %s" % kind
+
+    def upload_files(self):
+        for change in self.changes.values():
+            for upload in change.uploads:
+                upload["phid"] = conduit.file_upload(upload["value"])
+
+    def submit(self, repo_phid, commit, message):
+        changes = [
+            change.to_conduit(conduit.repo.get_public_node(commit["node"]))
+            for change in self.changes.values()
+        ]
+        diff = conduit.create_diff(
+            changes, conduit.repo.get_public_node(commit["parent"])
+        )
+
+        # Add information about our local commit to the patch. This info is
+        # needed by Lando.
+        conduit.set_diff_property(diff["diffid"], commit, message)
+
+        return diff["phid"]
+
 
 #
 # Repository
@@ -987,11 +1409,19 @@ def get_arcrc_path():
 
 class Repository(object):
     def __init__(self, path, dot_path, phab_url=None):
+        self._phid = None
+        self._phab_repo = None
+        self._vcs = None
         self.path = path  # base repository directory
         self.dot_path = dot_path  # .hg/.git directory
+        self._arcconfig_files = [
+            os.path.join(self.dot_path, ".arcconfig"),
+            os.path.join(self.path, ".arcconfig"),
+        ]
         self.args = None
-        self.phab_url = phab_url or self._phab_url()
+        self.phab_url = (phab_url or self._phab_url()).rstrip("/")
         self.api_url = self._api_url()
+        self.call_sign = self._get_setting("repository.callsign")
 
     def is_worktree_clean(self):
         """Check if the working tree is clean."""
@@ -1002,16 +1432,17 @@ class Repository(object):
     def after_submit(self):
         """Executed after the submit commit."""
 
+    def _get_setting(self, key):
+        """Read settings from .arcconfig"""
+        value = read_json_field(self._arcconfig_files, [key])
+        return value
+
     def _phab_url(self):
         """Determine the phab/conduit URL."""
 
         # In order of priority as per arc
         # FIXME: This should also check {.hg|.git}/arc/config, which is where
         # `arc set-config --local` writes to.  See bug 1497786.
-        arcconfig_files = [
-            os.path.join(self.dot_path, ".arcconfig"),
-            os.path.join(self.path, ".arcconfig"),
-        ]
         defaults_files = [get_arcrc_path()]
         if IS_WINDOWS:
             defaults_files.append(
@@ -1021,9 +1452,10 @@ class Repository(object):
             )
         else:
             defaults_files.append("/etc/arcconfig")
-        phab_url = read_json_field(
-            arcconfig_files, ["phabricator.uri"]
-        ) or read_json_field(defaults_files, ["config", "default"])
+
+        phab_url = self._get_setting("phabricator.uri") or read_json_field(
+            defaults_files, ["config", "default"]
+        )
 
         if not phab_url:
             raise Error("Failed to determine Phabricator URL (missing .arcconfig?)")
@@ -1139,17 +1571,31 @@ class Repository(object):
             if has_arc_rejections(commit["body"]):
                 commit_errors.append("contains arc fields")
 
+            if commit["rev-id"]:
+                revisions = conduit.get_revisions(ids=[int(commit["rev-id"])])
+                if len(revisions) == 0:
+                    commit_errors.append(
+                        "Phabricator did not return a query result for revision D%s"
+                        " (it might be inaccessible or not exist at all)"
+                        % commit["rev-id"]
+                    )
+
+            # commit_issues identified below this are commit_errors unless
+            # self.args.force is True, which makes them commit_warnings
+            commit_issues = (
+                commit_warnings if self.args and self.args.force else commit_errors
+            )
+
             for reviewer in commit_invalid_reviewers[commit["node"]]:
-                if "until" in reviewer:
+                if "disabled" in reviewer:
+                    commit_errors.append("User %s is disabled" % reviewer["name"])
+                elif "until" in reviewer:
                     unavailable_reviewers_warning = True
                     msg = "%s is not available until %s" % (
                         reviewer["name"],
                         reviewer["until"],
                     )
-                    if self.args.force:
-                        commit_warnings.append(msg)
-                    else:
-                        commit_errors.append(msg)
+                    commit_issues.append(msg)
                 else:
                     commit_errors.append(
                         "%s is not a valid reviewer's name" % reviewer["name"]
@@ -1196,6 +1642,59 @@ class Repository(object):
         """
         return urlparse.urljoin(self.phab_url, "api/")
 
+    @property
+    def phab_repo(self):
+        """Representation of the Repository in Phabricator API."""
+        if not self._phab_repo:
+            with wait_message("Reading repository data"):
+                self._phab_repo = conduit.get_repository(self.call_sign)
+
+        return self._phab_repo
+
+    @property
+    def phid(self):
+        """PHID of the repository.
+
+        This value does not change over time.
+        It is stored in a file to avoid calling the API on every run.
+        """
+        if not self._phid:
+            # check file
+            path = os.path.join(self.dot_path, ".moz-phab_phid")
+            if os.path.isfile(path):
+                with open(path) as f:
+                    self._phid = f.readline()
+            else:
+                self._phid = self.phab_repo["phid"]
+                with open(path, "w") as f:
+                    f.write(self._phid)
+
+        return self._phid
+
+    @property
+    def phab_vcs(self):
+        """Version Control System short name stored in Phabricator.
+
+        This value does not change over time.
+        It is stored in a file to avoid calling the API on every run.
+        """
+        if not self._vcs:
+            # check file
+            path = os.path.join(self.dot_path, ".moz-phab_vcs")
+            if os.path.isfile(path):
+                with open(path) as f:
+                    self._vcs = f.readline()
+            else:
+                self._vcs = self.phab_repo["fields"]["vcs"]
+                with open(path, "w") as f:
+                    f.write(self._vcs)
+
+        return self._vcs
+
+    def get_public_node(self, node):
+        """Hashtag in a remote VCS."""
+        return node
+
 
 #
 # Mercurial
@@ -1204,6 +1703,7 @@ class Repository(object):
 
 class Mercurial(Repository):
     def __init__(self, path):
+        self.vcs = "hg"
         dot_path = os.path.join(path, ".hg")
         if not os.path.isdir(dot_path):
             raise ValueError("%s: not a hg repository" % path)
@@ -1221,6 +1721,7 @@ class Mercurial(Repository):
         self.has_mq = False
         self.has_shelve = False
         self.previous_bookmark = None
+        self.has_temporary_bookmark = False
 
         # Normalise/standardise Mercurial's output.
         os.environ["HGPLAIN"] = "1"
@@ -1274,7 +1775,7 @@ class Mercurial(Repository):
         # be deleted in cleanup(). Mercurial will automatically move the
         # bookmark to the successors as we update commits.
         for active, bookmark in [
-            l.split(" ")
+            l.split(" ", 1)
             for l in self.hg_out(["bookmark", "-T", "{active} {bookmark}\n"])
         ]:
             if active == "True":
@@ -1284,6 +1785,7 @@ class Mercurial(Repository):
             self.previous_bookmark = "moz-phab_%s" % self.hg_out(
                 ["id", "-q"], split=False, strip=True
             )
+            self.has_temporary_bookmark = True
             self.hg(["bookmark", self.previous_bookmark])
 
     def after_submit(self):
@@ -1307,11 +1809,12 @@ class Mercurial(Repository):
             self.strip_nodes = []
 
         # Remove temporary bookmark
-        if self.previous_bookmark:
+        if self.has_temporary_bookmark:
             bookmarks = self.hg_out(["bookmark", "-T", "{bookmark}\n"])
             if self.previous_bookmark in bookmarks:
                 self.hg(["bookmark", "--delete", self.previous_bookmark])
             self.previous_bookmark = None
+            self.has_temporary_bookmark = False
 
     def _status(self):
         # `hg status` is slow on large repos.  As we'll need both uncommitted changes
@@ -1476,6 +1979,7 @@ class Mercurial(Repository):
                 {
                     "name": "%s:%s" % (rev, node[:12]),
                     "node": node,
+                    "public-node": node,
                     "orig-node": node,
                     "title": desc[0],
                     "title-preview": desc[0],
@@ -1552,7 +2056,7 @@ class Mercurial(Repository):
     def apply_patch(self, diff, body, author, author_date):
         commands = []
         if author:
-            commands.extend(["-u", author])
+            commands.extend(["-u", author.encode("utf8")])
 
         if author_date:
             commands.extend(["-d", author_date])
@@ -1742,6 +2246,11 @@ class Mercurial(Repository):
             commits, validate_reviewers=validate_reviewers
         )
 
+    def get_diff(self, commit):
+        raise NotImplementedError(
+            "Mercurial revisions can't be submitted without Arcanist"
+        )
+
 
 #
 # Git
@@ -1750,6 +2259,8 @@ class Mercurial(Repository):
 
 class Git(Repository):
     def __init__(self, path):
+        self._cinnabar_installed = None
+        self.vcs = "git"
         dot_path = os.path.join(path, ".git")
         if not os.path.exists(dot_path):
             raise ValueError("%s: not a git repository" % path)
@@ -1757,6 +2268,8 @@ class Git(Repository):
         logger.debug("found git repo in %s" % path)
 
         self._git = GIT_COMMAND[:]
+        if not which_path(self._git[0]):
+            raise Error("Failed to find 'git' executable")
 
         # `self._env` is a dict representing environment used in all git commands.
         self._env = os.environ.copy()
@@ -1772,6 +2285,46 @@ class Git(Repository):
         self.revset = None
         self.extensions = []
         self.branch = None
+
+    @property
+    def is_cinnabar_installed(self):
+        """Check if Cinnabar extension is callable."""
+        if self._cinnabar_installed is None:
+            self._cinnabar_installed = "cinnabar" in self.git_out(
+                ["--list-cmds=main,others"]
+            )
+
+        return self._cinnabar_installed
+
+    @property
+    def is_cinnabar_required(self):
+        """Check if local VCS is different than the remote one."""
+        return self.vcs != self.phab_vcs
+
+    def _hg_to_git(self, node):
+        """Convert Mercurial hashtag to Git."""
+        if not self.is_cinnabar_required:
+            return None
+
+        return self.git_out(["cinnabar", "hg2git", node], split=False)
+
+    def _git_to_hg(self, node):
+        """Convert Git hashtag to Mercurial."""
+        if not self.is_cinnabar_required:
+            return None
+
+        hg_node = self.git_out(["cinnabar", "git2hg", node], split=False)
+        return hg_node if hg_node != NULL_SHA1 else None
+
+    def get_public_node(self, node):
+        """Return a Mercurial node if Cinnabar is required."""
+        public_node = node
+        if self.is_cinnabar_required:
+            hg_node = self._git_to_hg(node)
+            if hg_node:
+                public_node = hg_node
+
+        return public_node
 
     def is_worktree_clean(self):
         return all(
@@ -1868,7 +2421,7 @@ class Git(Repository):
         cherry = ["cherry", "--abbrev=12"]
         remotes = config.git_remote
         if self.args.upstream:
-            cherry += self.args.upstream
+            remotes = self.args.upstream
         elif not remotes:
             remotes = self.git_out(["remote"])
             if len(remotes) > 1:
@@ -1910,7 +2463,7 @@ class Git(Repository):
         """Store moz-phab command line args and set the revset."""
         super(Git, self).set_args(args)
 
-        git_config = parse_config(self.git_out(["config", "--list"]))
+        git_config = parse_config(self.git_out(["config", "--list"], never_log=True))
 
         safe_options = []
 
@@ -2146,7 +2699,7 @@ class Git(Repository):
         """Commit the changes in the working directory."""
         commands = ["commit", "-a"]
         if author:
-            commands.append('--author="%s"' % author)
+            commands.append('--author="%s"' % author.encode("utf8"))
 
         if author_date:
             commands.append('--date="%s"' % author_date)
@@ -2235,8 +2788,20 @@ class Git(Repository):
                 ["commit-tree", "-p", parent, "-F", message_file, tree_hash],
                 split=False,
                 extra_env={
-                    "GIT_AUTHOR_NAME": author_name,
-                    "GIT_AUTHOR_EMAIL": author_email,
+                    "GIT_AUTHOR_NAME": (
+                        unicodedata.normalize("NFKD", author_name).encode(
+                            "ascii", "ignore"
+                        )
+                        if IS_WINDOWS
+                        else author_name.encode("utf-8")
+                    ),
+                    "GIT_AUTHOR_EMAIL": (
+                        unicodedata.normalize("NFKD", author_email).encode(
+                            "ascii", "ignore"
+                        )
+                        if IS_WINDOWS
+                        else author_email.encode("utf-8")
+                    ),
                     "GIT_AUTHOR_DATE": author_date,
                 },
             )
@@ -2299,6 +2864,183 @@ class Git(Repository):
 
     def _rebase(self, newbase, upstream):
         self.git(["rebase", "--quiet", "--onto", newbase, upstream])
+
+    def _file_size(self, blob):
+        return int(self.git_out(["cat-file", "-s", blob], split=False))
+
+    def _cat_file(self, blob):
+        return self.git_out(["cat-file", "blob", blob], split=False, expect_binary=True)
+
+    def _parse_diff_change(self, raw, diff):
+        """Parse the changes provided in raw `git` response.
+
+        Returns a Diff.Change object.
+        """
+        # find changed path
+        paths = raw.split("\0")
+        fields = paths.pop(0)
+        [a_mode, b_mode, a_blob, b_blob, kind_l] = fields.split(" ")
+
+        # Figure out what paths to use
+        if len(paths) == 2:
+            [a_path, b_path] = paths
+        else:
+            a_path = b_path = paths[0]
+
+        # create a Change object
+        change = diff.change_for(b_path)
+
+        # Extract the bodies of blobs to compare
+        if a_blob == NULL_SHA1:
+            a_blob, a_body, a_size = None, "", 0
+        else:
+            a_body = self._cat_file(a_blob)
+            a_size = self._file_size(a_blob)
+
+        if b_blob == NULL_SHA1:
+            b_blob, b_body, b_size = None, "", 0
+        else:
+            b_body = self._cat_file(b_blob)
+            b_size = self._file_size(b_blob)
+
+        file_size = max(a_size, b_size)
+
+        # Detect if we're binary, and generate a unified diff
+        if a_body:
+            try:
+                a_body = a_body.decode("utf-8")
+            except UnicodeDecodeError:
+                change.binary = True
+
+        if b_body:
+            try:
+                b_body = b_body.decode("utf-8")
+            except UnicodeDecodeError:
+                change.binary = True
+
+        if not change.binary and (
+            "\0" in a_body or "\0" in b_body or file_size > MAX_TEXT_SIZE
+        ):
+            change.binary = True
+
+        if change.binary:
+            a_mime = mimetypes.guess_type(a_path)[0] or ""
+            b_mime = mimetypes.guess_type(b_path)[0] or ""
+            change.uploads = [
+                {"type": "old", "value": a_body, "mime": a_mime, "phid": None},
+                {"type": "new", "value": b_body, "mime": b_mime, "phid": None},
+            ]
+            if a_mime.startswith("image/") or b_mime.startswith("image/"):
+                change.file_type = Diff.FileType("IMAGE")
+            else:
+                change.file_type = Diff.FileType("BINARY")
+        else:
+            # We can only diff changed blobs.
+            if a_blob == b_blob:
+                # No changes in the file contents.
+                lines = a_body.splitlines(True)
+                lines = [" %s" % l for l in lines]
+                old_off = new_off = 1
+                old_len = new_len = len(lines)
+            elif a_blob is None:
+                # The file is created.
+                lines = b_body.splitlines(True)
+                lines = ["+%s" % l for l in lines]
+                old_off = 0
+                new_off = 1
+                old_len = 0
+                new_len = len(lines)
+            elif b_blob is None:
+                # The file is removed.
+                lines = a_body.splitlines(True)
+                lines = ["-%s" % l for l in lines]
+                old_off = 1
+                new_off = 0
+                old_len = len(lines)
+                new_len = 0
+            else:
+                # There are changes in the file.
+                if self.args.lesscontext or file_size > MAX_CONTEXT_SIZE:
+                    context_size = 100
+                else:
+                    context_size = MAX_CONTEXT_SIZE
+
+                git_diff = self.git_out(
+                    ["diff", "-U%s" % context_size, a_blob, b_blob], split=False
+                )
+                lines = git_diff.splitlines(True)[4:]
+                hdr = lines.pop(0)
+                m = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", hdr, re.I)
+                old_off = int(m.group(1))
+                old_len = int(m.group(2) or 1)
+                new_off = int(m.group(3))
+                new_len = int(m.group(4) or 1)
+
+            # Collect some stats about the diff, and generate the corpus we
+            # want to send to Phabricator.
+            old_eof_newline = True
+            new_eof_newline = True
+            old_line = " "
+            corpus = "".join(lines)
+            for line in lines:
+                if line.endswith("No newline at end of file"):
+                    if old_line[0] != "+":
+                        old_eof_newline = False
+                    if old_line[0] != "-":
+                        new_eof_newline = False
+                old_line = line
+
+            change.hunks = [
+                diff.Hunk(
+                    old_off=old_off,
+                    old_len=old_len,
+                    new_off=new_off,
+                    new_len=new_len,
+                    old_eof_newline=old_eof_newline,
+                    new_eof_newline=new_eof_newline,
+                    added=sum(1 for l in lines if l[0] == "+"),
+                    deleted=sum(1 for l in lines if l[0] == "-"),
+                    corpus=corpus,
+                )
+            ]
+            change.file_type = diff.FileType("TEXT")
+
+        diff.set_change_kind(change, kind_l[0], a_mode, b_mode, a_path, b_path)
+
+        return change
+
+    def get_diff(self, commit):
+        """Create a Diff object with changes."""
+        raw = self.git_out(
+            [
+                "diff-tree",
+                "-r",
+                "--raw",
+                "-z",
+                "-M",
+                "-C",
+                "--no-abbrev",
+                commit["node"],
+            ],
+            split=False,
+        )
+
+        diff = Diff()
+        for raw_change in raw[:-1].split("\0:")[1:]:
+            self._parse_diff_change(raw_change, diff)
+
+        return diff
+
+    @property
+    def phab_vcs(self):
+        phab_vcs = super(Git, self).phab_vcs
+        if self.vcs != phab_vcs:
+            if not self.is_cinnabar_installed and not self.args.force_vcs:
+                raise Error(
+                    "Git Cinnabar extension is required to work on this repository."
+                )
+
+        return phab_vcs
 
 
 #
@@ -2513,20 +3255,32 @@ def show_commit_stack(
         # preload all revisions
         ids = [int(c["rev-id"]) for c in commits if c.get("rev-id")]
         if ids:
-            conduit.get_revisions(ids=ids)
+            with wait_message("Loading existing revisions..."):
+                conduit.get_revisions(ids=ids)
 
     for commit in reversed(commits):
         change_bug_id = False
+        is_author = True
         revision = None
 
         if commit.get("rev-id"):
             action = action_template % ("D" + commit["rev-id"])
             if validate:
-                # Check if target bug ID is the same as in the Phabricator revision
-                revision = conduit.get_revisions(ids=[int(commit["rev-id"])])[0]
-                change_bug_id = revision["fields"]["bugzilla.bug-id"] and (
-                    commit["bug-id"] != revision["fields"]["bugzilla.bug-id"]
-                )
+                revisions = conduit.get_revisions(ids=[int(commit["rev-id"])])
+                if len(revisions) > 0:
+                    revision = revisions[0]
+
+                    # Check if target bug ID is the same as in the Phabricator revision
+                    change_bug_id = revision["fields"]["bugzilla.bug-id"] and (
+                        commit["bug-id"] != revision["fields"]["bugzilla.bug-id"]
+                    )
+
+                    # Check if comandeering is required
+                    whoami = conduit.whoami()
+                    if "authorPHID" in revision["fields"] and (
+                        revision["fields"]["authorPHID"] != whoami["phid"]
+                    ):
+                        is_author = False
         else:
             action = action_template % "New"
 
@@ -2536,6 +3290,14 @@ def show_commit_stack(
                 logger.warning(
                     "!! Bug ID in Phabricator revision will be changed from %s to %s"
                     % (revision["fields"]["bugzilla.bug-id"], commit["bug-id"])
+                )
+
+            if not is_author:
+                logger.warning(
+                    "!! You don't own this revision.  Normally, you should only\n"
+                    '   update revisions you   own.  You can "Commandeer" this\n'
+                    "   revision from the web interface if you want to become\n"
+                    "   the owner."
                 )
 
             if commit["bug-id-orig"] and commit["bug-id"] != commit["bug-id-orig"]:
@@ -2551,9 +3313,7 @@ def show_commit_stack(
                 logger.warning("!! Missing reviewers")
 
         if show_rev_urls and commit["rev-id"]:
-            logger.warning(
-                "-> %s/D%s" % (conduit.phab_url.rstrip("/"), commit["rev-id"])
-            )
+            logger.warning("-> %s/D%s" % (conduit.repo.phab_url, commit["rev-id"]))
 
 
 def check_for_invalid_reviewers(reviewers):
@@ -2595,31 +3355,15 @@ def check_for_invalid_reviewers(reviewers):
         )
 
     if all_groups:
-        # See https://phabricator.services.mozilla.com/conduit/method/project.search/
-        api_call_args = {"queryKey": "active", "constraints": {"slugs": all_groups}}
-        result = conduit.call("project.search", api_call_args)
-        found_groups = [
-            "#%s" % normalise_reviewer(data["fields"]["slug"])
-            for data in result["data"]
-        ]
-        # We might be searching by the hashtag.
-        try:
-            if result["maps"]["slugMap"]:
-                found_groups.extend(
-                    [
-                        "#%s" % normalise_reviewer(r)
-                        for r in result["maps"]["slugMap"].keys()
-                    ]
-                )
-        except KeyError:
-            pass
+        groups = conduit.get_groups(all_groups)
+        found_groups = ["#%s" % normalise_reviewer(group["name"]) for group in groups]
 
     all_reviewers.extend(all_groups)
     found_names.extend(found_groups)
-    invalid_reviewers = list(set(all_reviewers) - set(found_names))
+    invalid = list(set(all_reviewers) - set(found_names))
 
     # Find users availability:
-    unavailable_reviewers = [
+    unavailable = [
         dict(
             name=r["userName"],
             until=datetime.datetime.fromtimestamp(r["currentStatusUntil"]).strftime(
@@ -2630,7 +3374,13 @@ def check_for_invalid_reviewers(reviewers):
         if r.get("currentStatus") == "away"
     ]
 
-    return unavailable_reviewers + [dict(name=r) for r in invalid_reviewers]
+    # Find disabled users:
+    disabled = [
+        dict(name=r["userName"], disabled=True)
+        for r in users
+        if "disabled" in r.get("roles", [])
+    ]
+    return disabled + unavailable + [dict(name=r) for r in invalid]
 
 
 #
@@ -2741,11 +3491,6 @@ def install_arc_if_required():
     check_call(["git", "clone", "--depth", "1", LIBPHUTIL_URL, LIBPHUTIL_PATH])
 
 
-def arc_install_certificate(_):
-    """Calls arc to install the Phabricator's certificate."""
-    check_call([ARC_COMMAND, "install-certificate"])
-
-
 def arc_ping(cwd):
     """Sends a ping to the Phabricator server using `conduit.ping` API.
 
@@ -2759,6 +3504,23 @@ def arc_ping(cwd):
     except CommandError:
         return False
     return True
+
+
+#
+# "install-certificate" command
+#
+
+
+def install_certificate(repo, args):
+    """Asks user to enter the Phabricator's certificate.
+
+    The response is saved in the ~/.arcrc file."""
+    logger.info(
+        "LOGIN TO PHABRICATOR\nOpen this page in your browser and login "
+        "to Phabricator if necessary:\n\n%s/conduit/login/\n" % conduit.repo.phab_url
+    )
+    token = prompt("Paste API Token from that page: ")
+    conduit.save_api_token(token)
 
 
 #
@@ -2892,43 +3654,58 @@ def update_commits_from_args(commits, args):
     update_commit_title_previews(commits)
 
 
-def build_api_call_to_update_commit_title_and_summary(commit):
-    """Build a Conduit API transaction to update a commit title and summary.
+def update_revision_description(transactions, commit, revision):
+    # Appends differential.revision.edit transaction(s) to `transactions` if
+    # updating the commit title and/or summary is required.
 
-    See https://phabricator.services.mozilla.com/api/differential.revision.edit for
-    the returned JSON object format.
+    if commit["title"] != revision["fields"]["title"]:
+        transactions.append(dict(type="title", value=commit["title"]))
 
-    Args:
-        commit: A VCS commit data dict to use for the call args.
-
-    Returns:
-        A JSON dict that can be passed to a Conduit differential.revision.edit API call.
-    """
     # The Phabricator API will refuse the new summary value if we include the
     # "Differential Revision:" keyword in the summary body.
-    transactions = [
-        dict(type="title", value=commit["title"]),
-        dict(
-            type="summary",
-            value=strip_differential_revision(commit["body"]).encode("utf8"),
-        ),
-    ]
-    return {"transactions": transactions, "objectIdentifier": commit["rev-id"]}
+    local_body = strip_differential_revision(commit["body"]).strip()
+    remote_body = strip_differential_revision(revision["fields"]["summary"]).strip()
+    if local_body != remote_body:
+        transactions.append(dict(type="summary", value=local_body))
 
 
-def build_transaction_to_update_reviewers(commit):
-    # Add reviewers
-    all_reviewers = commit["reviewers"]["request"] + commit["reviewers"]["granted"]
+def update_revision_bug_id(transactions, commit, revision):
+    # Appends differential.revision.edit transaction(s) to `transactions` if
+    # updating the commit bug-id is required.
+    if commit["bug-id"] != revision["fields"]["bugzilla.bug-id"]:
+        transactions.append(dict(type="bugzilla.bug-id", value=commit["bug-id"]))
+
+
+def update_revision_reviewers(transactions, commit):
+    # Appends differential.revision.edit transaction(s) to `transactions` to
+    # set the reviewers.
+
+    all_reviewing = commit["reviewers"]["request"] + commit["reviewers"]["granted"]
+
+    # Find reviewers PHIDs
+    all_reviewers = [r for r in all_reviewing if not r.startswith("#")]
     # preload all reviewers
     conduit.get_users(all_reviewers)
-
     reviewers = [r for r in all_reviewers if not r.endswith("!")]
-    blocking = [r.rstrip("!") for r in all_reviewers if r.endswith("!")]
+    blocking_reviewers = [r.rstrip("!") for r in all_reviewers if r.endswith("!")]
     reviewers_phid = [user["phid"] for user in conduit.get_users(reviewers)]
     blocking_phid = [
-        "blocking(%s)" % user["phid"] for user in conduit.get_users(blocking)
+        "blocking(%s)" % user["phid"] for user in conduit.get_users(blocking_reviewers)
     ]
-    return [dict(type="reviewers.set", value=reviewers_phid + blocking_phid)]
+
+    # Find groups PHIDs
+    all_groups = [g for g in all_reviewing if g.startswith("#")]
+    groups = [g for g in all_groups if not g.endswith("!")]
+    blocking_groups = [g.rstrip("!") for g in all_groups if g.endswith("!")]
+    # preload all groups
+    conduit.get_groups(all_groups)
+    groups_phid = [group["phid"] for group in conduit.get_groups(groups)]
+    bl_groups_phid = [
+        "blocking(%s)" % group["phid"] for group in conduit.get_groups(blocking_groups)
+    ]
+
+    all_reviewing_phid = reviewers_phid + blocking_phid + groups_phid + bl_groups_phid
+    transactions.extend([dict(type="reviewers.set", value=all_reviewing_phid)])
 
 
 def submit(repo, args):
@@ -3018,7 +3795,7 @@ def submit(repo, args):
     rev_ids_to_update = [int(c["rev-id"]) for c in commits if c.get("rev-id")]
     revisions_to_update = None
     if rev_ids_to_update:
-        with wait_message("Checking Phabricator.."):
+        with wait_message("Loading revision data..."):
             list_to_update = conduit.get_revisions(ids=rev_ids_to_update)
 
         revisions_to_update = {str(r["id"]): r for r in list_to_update}
@@ -3026,11 +3803,12 @@ def submit(repo, args):
     for commit in commits:
         # Only revisions being updated have an ID.  Newly created ones don't.
         is_update = bool(commit["rev-id"])
+        revision_to_update = (
+            revisions_to_update[commit["rev-id"]] if is_update else None
+        )
         existing_reviewers = (
-            revisions_to_update[commit["rev-id"]]["attachments"]["reviewers"][
-                "reviewers"
-            ]
-            if commit["rev-id"]
+            revision_to_update["attachments"]["reviewers"]["reviewers"]
+            if revision_to_update
             else None
         )
         has_commit_reviewers = bool(
@@ -3061,81 +3839,112 @@ def submit(repo, args):
             reviewers=reviewers,
             bug_id=commit["bug-id"],
         )
+        summary = commit["body"]
         if previous_commit and not args.no_stack:
             template_vars["depends_on"] = "Depends on D%s" % previous_commit["rev-id"]
+            summary = "%s\n\n%s" % (summary, template_vars["depends_on"])
+
         message = arc_message(template_vars)
 
-        # Run arc.
-        with temporary_file(message.encode("utf8")) as message_file:
-            arc_args = (
-                ["diff"]
-                + ["--base", "arc:this"]
-                + ["--allow-untracked", "--no-amend", "--no-ansi"]
-                + ["--message-file", message_file]
-            )
-            if args.nolint:
-                arc_args.append("--nolint")
-            if args.wip:
-                arc_args.append("--plan-changes")
-            if args.lesscontext:
-                arc_args.append("--less-context")
-            if is_update:
-                message = args.message if args.message else DEFAULT_UPDATE_MESSAGE
-                arc_args.extend(
-                    ["--message", message.decode("utf8")]
-                    + ["--update", commit["rev-id"]]
-                )
+        if args.no_arc:
+            # Create a diff if needed
+            with wait_message("Creating local diff..."):
+                diff = repo.get_diff(commit)
+
+            if diff:
+                with wait_message("Uploading binary file(s)..."):
+                    diff.upload_files()
+
+                with wait_message("Submitting the diff..."):
+                    diff_phid = diff.submit(repo.phid, commit, message)
             else:
-                arc_args.append("--create")
+                diff_phid = None
 
-            revision_url = None
-            for line in check_call_by_line(
-                ARC + arc_args, cwd=repo.path, never_log=True
-            ):
-                print(line)
-
-                # Extract Revision URL.
-                m = ARC_OUTPUT_REV_URL_RE.search(line)
-                if m:
-                    revision_url = m.group(1)
-
-        if not revision_url:
-            raise Error("Failed to find 'Revision URL' in arc output")
-
-        if is_update:
-            with wait_message("Updating D%s.." % commit["rev-id"]):
-                try:
-                    conduit.update_phabricator_commit_summary(commit)
-                except Exception as e:
-                    logger.warning(
-                        "Warning: failed to update commit summary in Phabricator"
+            if is_update:
+                with wait_message("Updating revision..."):
+                    rev = conduit.update_revision(
+                        commit,
+                        has_commit_reviewers,
+                        existing_reviewers,
+                        diff_phid=diff_phid,
+                        wip=args.wip,
+                        comment=args.message.decode("utf8") if args.message else None,
                     )
-                    logger.debug(e)
-
-                # Update bug id if different
-                revision = conduit.get_revisions(ids=[int(commit["rev-id"])])[0]
-                transactions = []
-                if revision["fields"]["bugzilla.bug-id"] != commit["bug-id"]:
-                    transactions.append(
-                        dict(type="bugzilla.bug-id", value=commit["bug-id"])
+            else:
+                with wait_message("Creating a new revision..."):
+                    rev = conduit.create_revision(
+                        commit,
+                        commit["title-preview"],
+                        summary,
+                        diff_phid,
+                        has_commit_reviewers,
+                        wip=args.wip,
                     )
 
-                # Add reviewers only if revision lacks them
-                if has_commit_reviewers and not args.wip:
+            revision_url = "%s/D%s" % (repo.phab_url, rev["object"]["id"])
+
+        else:
+            # Run arc.
+            with temporary_file(message.encode("utf8")) as message_file:
+                arc_args = (
+                    ["diff"]
+                    + ["--base", "arc:this"]
+                    + ["--allow-untracked", "--no-amend", "--no-ansi"]
+                    + ["--message-file", message_file]
+                )
+                if args.nolint:
+                    arc_args.append("--nolint")
+                if args.wip:
+                    arc_args.append("--plan-changes")
+                if args.lesscontext:
+                    arc_args.append("--less-context")
+                if is_update:
+                    message = args.message if args.message else DEFAULT_UPDATE_MESSAGE
+                    arc_args.extend(
+                        ["--message", message.decode("utf8")]
+                        + ["--update", commit["rev-id"]]
+                    )
+                else:
+                    arc_args.append("--create")
+
+                revision_url = None
+                for line in check_call_by_line(
+                    ARC + arc_args, cwd=repo.path, never_log=True
+                ):
+                    print(line)
+
+                    # Extract Revision URL.
+                    m = ARC_OUTPUT_REV_URL_RE.search(line)
+                    if m:
+                        revision_url = m.group(1)
+
+            if not revision_url:
+                raise Error("Failed to find 'Revision URL' in arc output")
+
+            if is_update:
+                current_status = revision_to_update["fields"]["status"]["value"]
+                with wait_message("Updating D%s.." % commit["rev-id"]):
+                    transactions = []
+                    revision = conduit.get_revisions(ids=[int(commit["rev-id"])])[0]
+
+                    update_revision_description(transactions, commit, revision)
+                    update_revision_bug_id(transactions, commit, revision)
+
                     # Add reviewers only if revision lacks them
-                    if not existing_reviewers:
-                        transactions.extend(
-                            build_transaction_to_update_reviewers(commit)
-                        )
+                    if not args.wip and has_commit_reviewers and not existing_reviewers:
+                        update_revision_reviewers(transactions, commit)
+                        if current_status != "needs-review":
+                            transactions.append(dict(type="request-review"))
 
-                if transactions:
-                    api_call_args = {
-                        "objectIdentifier": "D%s" % commit["rev-id"],
-                        "transactions": transactions,
-                    }
-                    arc_call_conduit(
-                        "differential.revision.edit", api_call_args, repo.path
-                    )
+                    if transactions:
+                        arc_call_conduit(
+                            "differential.revision.edit",
+                            {
+                                "objectIdentifier": "D%s" % commit["rev-id"],
+                                "transactions": transactions,
+                            },
+                            repo.path,
+                        )
 
         # Append/replace div rev url to/in commit description.
         body = amend_revision_url(commit["body"], revision_url)
@@ -3204,9 +4013,11 @@ def update_arc():
 
     def update_repo(name, path):
         logger.info("Updating %s..." % name)
-        rev = check_output(["git", "rev-parse", "HEAD"], split=False, cwd=path)
-        check_call(["git", "pull", "--quiet"], cwd=path)
-        if rev != check_output(["git", "rev-parse", "HEAD"], split=False, cwd=path):
+        rev = check_output(GIT_COMMAND + ["rev-parse", "HEAD"], split=False, cwd=path)
+        check_call(GIT_COMMAND + ["pull", "--quiet"], cwd=path)
+        if rev != check_output(
+            GIT_COMMAND + ["rev-parse", "HEAD"], split=False, cwd=path
+        ):
             logger.info("%s updated" % name)
         else:
             logger.info("Update of %s not required" % name)
@@ -3259,6 +4070,12 @@ def check_for_updates():
 
 def self_update(args):
     """`self-update` command, updates arc and this script"""
+    if not which_path(GIT_COMMAND[0]):
+        raise Error(
+            "Failed to find 'git' executable, which is required to install "
+            "MozPhab's dependencies."
+        )
+
     # Update arc.
     if config.arc_last_check >= 0:
         update_arc()
@@ -3291,7 +4108,7 @@ def self_update(args):
 def apply_patch(diff, cwd):
     """Apply a patch provided in the `diff`."""
     with temporary_file(diff) as temp_f:
-        check_call(["git", "apply", temp_f], cwd=cwd)
+        check_call([GIT_COMMAND[0], "apply", temp_f], cwd=cwd)
 
 
 def get_base_ref(diff):
@@ -3338,7 +4155,6 @@ def patch(repo, args):
     * Error if `--apply-to base` and no base commit found in the first diff
     * Error if base commit not found in repository
     """
-
     # Check if raw Conduit API can be used
     if not conduit.check():
         raise Error("Failed to use Conduit API")
@@ -3457,7 +4273,7 @@ def patch(repo, args):
 
         if args.apply_to != "here":
             try:
-                with wait_message("Checking out %s.." % base_node[:12]):
+                with wait_message("Checking %s.." % base_node[:12]):
                     base_node = repo.check_node(base_node)
             except NotFoundError as e:
                 msg = "Unknown revision: %s" % base_node[:12]
@@ -3489,6 +4305,11 @@ def patch(repo, args):
 
         raw = raw.encode("utf8")
         if args.no_commit:
+            if repo.vcs == "hg" and not which_path(GIT_COMMAND[0]):
+                raise Error(
+                    "Failed to find 'git' executable.\n"
+                    "Git is required to apply patches."
+                )
             with wait_message("Applying D%s.." % rev["id"]):
                 apply_patch(raw, repo.path)
 
@@ -3681,6 +4502,14 @@ def parse_args(argv):
         help='Set upstream branch to detect the starting commit. (default: "")',
     )
     submit_parser.add_argument(
+        "--no-arc", action="store_true", help="EXPERIMENTAL: Submit without Arcanist."
+    )
+    submit_parser.add_argument(
+        "--force-vcs",
+        action="store_true",
+        help="EXPERIMENTAL: Override VCS compatibility check.",
+    )
+    submit_parser.add_argument(
         "--safe-mode",
         dest="safe_mode",
         action="store_true",
@@ -3779,7 +4608,13 @@ def parse_args(argv):
     cert_parser = commands.add_parser(
         "install-certificate", help="Install Phabricator certificate locally"
     )
-    cert_parser.set_defaults(func=arc_install_certificate, needs_repo=False)
+    cert_parser.add_argument(
+        "--safe-mode",
+        dest="safe_mode",
+        action="store_true",
+        help="Run VCS with only necessary extensions.",
+    )
+    cert_parser.set_defaults(func=install_certificate, needs_repo=True)
 
     # arc
 
@@ -3812,9 +4647,6 @@ def main(argv):
         if config.no_ansi:
             HAS_ANSI = False
 
-        if not which_path(GIT_COMMAND[0]):
-            raise Error("Failed to find 'git' executable")
-
         install_arc_if_required()
 
         # Ensure ssl certificates are validated (see PEP 476).
@@ -3846,7 +4678,7 @@ def main(argv):
             with wait_message("Starting up.."):
                 repo = repo_from_args(args)
 
-            conduit.set_args_from_repo(repo)
+            conduit.set_repo(repo)
             try:
                 args.func(repo, args)
             finally:

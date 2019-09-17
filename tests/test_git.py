@@ -1,3 +1,5 @@
+# coding=utf-8
+
 import imp
 import mock
 import os
@@ -39,12 +41,11 @@ def test_first_unpublished(m_config, m_git_cherry, m_git_git_out, git):
     assert first() is None
     with pytest.raises(mozphab.Error):
         first()
-        m_git_cherry.assert_called_with(["cherry", "--abbrev=12", "upstream"], [])
 
     m_git_cherry.side_effect = ([],)
     git.args = Args(upstream=["upstream"])
     first()
-    m_git_cherry.assert_called_with(["cherry", "--abbrev=12", "upstream"], [])
+    m_git_cherry.assert_called_with(["cherry", "--abbrev=12"], ["upstream"])
 
     m_git_cherry.side_effect = ([],)
     m_config.git_remote = ["someremote"]
@@ -395,3 +396,33 @@ def test_is_node(m_git_out, git):
 
     m_git_out.side_effect = mozphab.CommandError
     assert not git.is_node("aaa")
+
+
+@mock.patch("mozphab.Git.git_out")
+def test_is_cinnabar(m_git_out, git):
+    m_git_out.return_value = ["reset", "cinnabar"]
+    assert git.is_cinnabar_installed
+    m_git_out.assert_called_once_with(["--list-cmds=main,others"])
+
+    m_git_out.return_value = ["reset"]
+    assert git.is_cinnabar_installed
+    m_git_out.assert_called_once_with(["--list-cmds=main,others"])
+    m_git_out.reset_mock()
+    git._cinnabar_installed = None
+    assert not git.is_cinnabar_installed
+    m_git_out.assert_called_once_with(["--list-cmds=main,others"])
+
+
+@mock.patch("mozphab.Git.git_out")
+def test_unicode_in_windows_env(m_git_out, git, monkeypatch):
+    utf8 = "ćwikła".decode("utf-8")
+    asci = "cwika"
+    monkeypatch.setattr(mozphab, "IS_WINDOWS", True)
+    git._commit_tree("parent", "tree_hash", "message", utf8, utf8, "date")
+    m_git_out.assert_called_once_with(
+        ["commit-tree", "-p", "parent", "-F", mock.ANY, "tree_hash"],
+        split=False,
+        extra_env=dict(
+            GIT_AUTHOR_NAME=asci, GIT_AUTHOR_EMAIL=asci, GIT_AUTHOR_DATE="date"
+        ),
+    )

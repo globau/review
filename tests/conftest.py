@@ -9,6 +9,8 @@ import pytest
 import subprocess
 import sys
 
+from pathlib2 import Path
+
 mozphab = imp.load_source(
     "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
 )
@@ -30,13 +32,20 @@ def reset_cache():
 
 
 @pytest.fixture
+def data_file():
+    return Path(__file__).parent / "data" / "img.png"
+
+
+@pytest.fixture
 @mock.patch("mozphab.Git.git_out")
 @mock.patch("mozphab.Git._get_current_head")
 @mock.patch("mozphab.Config")
 @mock.patch("mozphab.os.path")
 @mock.patch("mozphab.which")
 @mock.patch("mozphab.Repository._phab_url")
+@mock.patch("mozphab.read_json_field")
 def git(
+    m_read_json_field,
     m_repository_phab_url,
     m_which,
     m_os_path,
@@ -44,6 +53,7 @@ def git(
     m_git_get_current_head,
     m_git_git_out,
 ):
+    m_read_json_field.return_value = "TEST"
     m_os_path.join = os.path.join
     m_os_path.exists.return_value = True
     m_which.return_value = True
@@ -58,7 +68,17 @@ def git(
 @mock.patch("mozphab.os.path")
 @mock.patch("mozphab.which")
 @mock.patch("mozphab.Repository._phab_url")
-def hg(m_repository_phab_url, m_which, m_os_path, m_config, m_hg_hg_out, safe_environ):
+@mock.patch("mozphab.read_json_field")
+def hg(
+    m_read_json_field,
+    m_repository_phab_url,
+    m_which,
+    m_os_path,
+    m_config,
+    m_hg_hg_out,
+    safe_environ,
+):
+    m_read_json_field.return_value = "TEST"
     m_os_path.join = os.path.join
     m_config.safe_mode = False
     m_os_path.exists.return_value = True
@@ -141,16 +161,13 @@ def in_process(monkeypatch, safe_environ, request):
     # Disable calls to sys.exit() at the end of the script.  Re-raise errors instead
     # to make test debugging easier.
     def reraise(*args, **kwargs):
-        t, v, tb = sys.exc_info()
-        raise t, v, tb
+        raise
 
     monkeypatch.setattr(sys, "exit", reraise)
 
     # Disable uploading a new commit title and summary to Phabricator.  This operation
     # is safe to skip and doing so makes it easier to test other conduit call sites.
-    monkeypatch.setattr(
-        mozphab.ConduitAPI, "update_phabricator_commit_summary", mock.MagicMock()
-    )
+    monkeypatch.setattr(mozphab, "update_revision_description", mock.MagicMock())
 
     def arc_ping(self, *args):
         return True
@@ -188,3 +205,12 @@ def in_process(monkeypatch, safe_environ, request):
 
     call_conduit = getattr(request.module, "call_conduit", call_conduit_static)
     monkeypatch.setattr(mozphab.ConduitAPI, "call", call_conduit)
+
+    def read_json_field_local(self, *args):
+        if args[0][0] == "phabricator.uri":
+            return "http://example.test"
+        elif args[0][0] == "repository.callsign":
+            return "TEST"
+
+    read_json_field = getattr(request.module, "read_json_field", read_json_field_local)
+    monkeypatch.setattr(mozphab, "read_json_field", read_json_field)
