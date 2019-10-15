@@ -3,9 +3,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-import errno
 import imp
-import json
 import mock
 import os
 import pytest
@@ -32,8 +30,8 @@ def test_set_args_from_repo():
 
 
 args_query_testdata = [
-    [dict(a=u"Ą"), [("a", u"Ą")]],
-    [dict(a="A", B="b"), [("a", "A"), ("B", "b")]],
+    [dict(a="Ą"), [("a", "Ą")]],
+    [dict(a="A", B="b"), [("B", "b"), ("a", "A")]],
     [dict(a=1), [("a", "1")]],
     [dict(arr=["a", 1, 2]), [("arr[0]", "a"), ("arr[1]", "1"), ("arr[2]", "2")]],
     [dict(a=dict(b=[1])), [("a[b][0]", "1")]],
@@ -55,30 +53,30 @@ def test_load_api_token(m_read):
     assert mozphab.conduit.load_api_token() == "x"
 
 
-@mock.patch("mozphab.urllib2.Request")
-@mock.patch("mozphab.urllib2.urlopen")
+@mock.patch("mozphab.urllib.request.Request")
+@mock.patch("mozphab.urllib.request.urlopen")
 @mock.patch("mozphab.ConduitAPI.load_api_token")
 def test_call(m_token, m_urlopen, m_Request):
     req = mock.Mock()
     response = mock.Mock()
     m_Request.return_value = req
     m_urlopen.return_value = response
-    response.read.return_value = json.dumps(dict(result="x", error_code=False))
+    response.read.return_value = b'{"result": "x", "error_code": false}'
     m_token.return_value = "token"
     mozphab.conduit.set_repo(Repo())
 
     assert mozphab.conduit.call("method", dict(call="args")) == "x"
     m_Request.assert_called_once_with(
-        "http://api_url/method", data="api.token=token&call=args"
+        "http://api_url/method", data=b"api.token=token&call=args"
     )
     m_urlopen.assert_called_once()
 
-    assert mozphab.conduit.call("method", dict(call=u"ćwikła")) == "x"
+    assert mozphab.conduit.call("method", dict(call="ćwikła")) == "x"
     m_Request.assert_called_with(
-        "http://api_url/method", data="api.token=token&call=%C4%87wik%C5%82a"
+        "http://api_url/method", data=b"api.token=token&call=%C4%87wik%C5%82a"
     )
 
-    response.read.return_value = json.dumps(dict(error_code=1, error_info="x"))
+    response.read.return_value = b'{"error_info": "x", "error_code": 1}'
 
     with pytest.raises(mozphab.ConduitAPIError):
         mozphab.conduit.call("method", dict(call="args"))
@@ -99,7 +97,7 @@ def test_ping(m_call):
 @mock.patch("mozphab.ConduitAPI.call")
 @mock.patch("mozphab.ConduitAPI.ping")
 @mock.patch("mozphab.os")
-@mock.patch("__builtin__.open")
+@mock.patch("builtins.open")
 def test_check(m_open, m_os, m_ping, m_call):
     check = mozphab.conduit.check
 
@@ -281,7 +279,7 @@ def test_get_related_phids(m_call):
     assert ["aaa"] == get_related_phids("ccc", include_abandoned=False)
 
 
-@mock.patch("__builtin__.open")
+@mock.patch("builtins.open")
 @mock.patch("mozphab.json")
 @mock.patch("mozphab.get_arcrc_path")
 def test_save_api_token(m_get_arcrc_path, m_json, m_open, git):
@@ -294,11 +292,11 @@ def test_save_api_token(m_get_arcrc_path, m_json, m_open, git):
     mozphab.get_arcrc_path.return_value = ".arcrc"
     git.api_url = "http://test/api/"
     mozphab.conduit.set_repo(git)
-    m_open.side_effect = IOError(errno.EPERM, "Operation not permitted")
-    with pytest.raises(IOError):
+    m_open.side_effect = PermissionError
+    with pytest.raises(PermissionError):
         save_api_token("abc")
 
-    m_open.side_effect = (IOError(errno.ENOENT, "Not a file"), with_open())
+    m_open.side_effect = (FileNotFoundError, with_open())
     save_api_token("abc")
 
     m_json.dump.assert_called_once_with(

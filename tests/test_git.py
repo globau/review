@@ -5,7 +5,7 @@ import mock
 import os
 import pytest
 
-from conftest import create_temp_fn
+from .conftest import create_temp_fn
 
 mozphab = imp.load_source(
     "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
@@ -415,8 +415,8 @@ def test_is_cinnabar(m_git_out, git):
 
 @mock.patch("mozphab.Git.git_out")
 def test_unicode_in_windows_env(m_git_out, git, monkeypatch):
-    utf8 = "ćwikła".decode("utf-8")
-    asci = "cwika"
+    utf8 = "ćwikła"
+    asci = b"cwika"
     monkeypatch.setattr(mozphab, "IS_WINDOWS", True)
     git._commit_tree("parent", "tree_hash", "message", utf8, utf8, "date")
     m_git_out.assert_called_once_with(

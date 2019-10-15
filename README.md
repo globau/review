@@ -2,33 +2,13 @@
 
 ## Installation
 
-### Linux and MacOS
+`moz-phab` can be installed with `pip install MozPhab`.
 
-Download moz-phab from the [latest release](https://github.com/mozilla-conduit/review/releases/latest/)
-and place it on your system path.
+For detailed installation instructions please see:
 
-You must have Python 2.7 installed, and preferably in your path.
-
-### Windows with MozillaBuild/MSYS
-
-Download moz-phab from the [latest release](https://github.com/mozilla-conduit/review/releases/latest/)
-and place it on your system path.
-
-You must have Python 2.7 installed, and preferably in your path.
-
-### Other Windows Installs
-
-Download moz-phab from the [latest release](https://github.com/mozilla-conduit/review/releases/latest/)
-and store it anywhere (e.g. `C:\Users\myuser\phabricator\moz-phab`).
-
-You must have Python 2.7 installed, and preferably in your path.
-
-Run python with the full path to moz-phab:
-`python C:\Users\myuser\phabricator\moz-phab`.
-
-If you are using `MinTTY` (e.g. via Git's Bash) you'll need to run it through `winpty`
-as with any other Python script:
-`winpty python C:\Users\myuser\phabricator\moz-phab`.
+- [Windows Install Instructions](https://moz-conduit.readthedocs.io/en/latest/mozphab-windows.html)
+- [Linux Install Instructions](https://moz-conduit.readthedocs.io/en/latest/mozphab-linux.html)
+- [macOS Install Instructions](https://moz-conduit.readthedocs.io/en/latest/mozphab-macos.html)
 
 ## Configuration
 
@@ -59,10 +39,12 @@ always_full_stack = False
 [updater]
 self_last_check = 
 arc_last_check = 
+self_auto_update = True
 ```
 
 - `ui.no_ansi` : never use ANSI colours (default: auto-detected).
-- `vcs.safe_mode` : use only safe VCS settings (default: false). Use `--safe-mode` option to switch it on for a one-time usage.
+- `vcs.safe_mode` : use only safe VCS settings (default: false). Use `--safe-mode` 
+    option to switch it on for a one-time usage.
 - `git.remote`: comma separated string. Default remotes used to find the first
     unpublished commit. Default, empty string, means that a list of remotes will
     be read from `git remote` command.
@@ -86,6 +68,8 @@ arc_last_check =
     an update check was performed for this script.  set to `-1` to disable this check.
 - `updater.arc_last_check` : epoch timestamp (local timezone) indicating the last time
     an update was performed for arc.  set to `-1` to disable this check.
+- `self_auto_update` : when `True` moz-phab will auto-update if a new version is available.
+    If `False` moz-phab will only warn about the new version.
 
 `moz-phab` can also be configured via the following environmental variables:
 - `DEBUG` : enabled debugging output (default: disabled)
@@ -155,7 +139,7 @@ Note that if you do not have Python in your path, you will need to run
 invocation is
 
 ```
-$ moz-phab patch rev_id
+  $ moz-phab patch rev_id
 ```
 
 To patch a stack ending with the revision `D123` run `moz-phab patch D123`.
