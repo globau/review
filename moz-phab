@@ -243,7 +243,12 @@ def parse_zulu_time(timestamp):
 def check_call(command, **kwargs):
     # wrapper around subprocess.check_call with debug output
     logger.debug("$ %s" % " ".join(quote(s) for s in command))
-    subprocess.check_call(command, **kwargs)
+    try:
+        subprocess.check_call(command, **kwargs)
+    except subprocess.CalledProcessError as e:
+        raise CommandError(
+            "command '%s' failed to complete successfully" % command[0], e.returncode
+        )
 
 
 def check_call_by_line(command, cwd=None, never_log=False):
@@ -270,7 +275,10 @@ def check_call_by_line(command, cwd=None, never_log=False):
         process.wait()
 
     if process.returncode:
-        raise subprocess.CalledProcessError(process.returncode, command)
+        raise CommandError(
+            "command '%s' failed to complete successfully" % command[0],
+            process.returncode,
+        )
 
 
 def check_output(
@@ -302,7 +310,12 @@ def check_output(
                 if err["matching"] in e.output:
                     logger.error(err["message"])
 
-        logger.debug(e.output)
+        if e.output and not never_log:
+            logger.debug(e.output)
+
+        if e.stderr and not never_log:
+            logger.debug(e.stderr)
+
         raise CommandError(
             "command '%s' failed to complete successfully" % command[0], e.returncode
         )
@@ -411,6 +424,18 @@ def normalise_reviewer(reviewer, strip_group=True):
 @contextmanager
 def temporary_file(content, encoding="utf-8"):
     f = tempfile.NamedTemporaryFile(delete=False, mode="w+", encoding=encoding)
+    try:
+        f.write(content)
+        f.flush()
+        f.close()
+        yield f.name
+    finally:
+        os.remove(f.name)
+
+
+@contextmanager
+def temporary_binary_file(content):
+    f = tempfile.NamedTemporaryFile(delete=False, mode="wb+")
     try:
         f.write(content)
         f.flush()
@@ -1987,7 +2012,7 @@ class Mercurial(Repository):
     def is_node(self, node):
         try:
             self.hg_out(["identify", "-q", "-r", node])
-        except subprocess.CalledProcessError:
+        except CommandError:
             return False
 
         return True
@@ -2729,7 +2754,9 @@ class Git(Repository):
             logger.info("Created branch %s" % branch_name)
 
     def apply_patch(self, diff, body, author, author_date):
-        with temporary_file(diff) as patch_file:
+        # apply the patch as a binary file to ensure the correct line endings
+        # is used.
+        with temporary_binary_file(diff.encode("utf8")) as patch_file:
             self.git(["apply", "--index", patch_file])
         self.commit(body, author, author_date)
 
@@ -3963,7 +3990,7 @@ def update_arc():
     try:
         update_repo("libphutil", LIBPHUTIL_PATH)
         update_repo("arcanist", ARC_PATH)
-    except subprocess.CalledProcessError:
+    except CommandError:
         result = prompt(
             "Would you like to skip arc upgrades in the future?", ["Yes", "No"]
         )
@@ -4045,7 +4072,7 @@ def self_update(_):
 
 def apply_patch(diff, cwd):
     """Apply a patch provided in the `diff`."""
-    with temporary_file(diff) as temp_f:
+    with temporary_binary_file(diff.encode("utf8")) as temp_f:
         check_call([GIT_COMMAND[0], "apply", temp_f], cwd=cwd)
 
 
@@ -4282,7 +4309,7 @@ def arc_pass(args):
 
     try:
         check_call(ARC + args.commands)
-    except subprocess.CalledProcessError:
+    except CommandError:
         pass
 
 
