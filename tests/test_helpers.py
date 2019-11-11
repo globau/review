@@ -526,3 +526,16 @@ def test_parse_config_with_filter():
 
     res = mozphab.parse_config(["imin=I'm in", "out=not here"], _filter)
     assert res == dict(imin="I'm in")
+
+
+def test_short_node():
+    assert (
+        mozphab.short_node("b016b6080ff9fa6d9ac459950e24bdcdaa939be0") == "b016b6080ff9"
+    )
+    assert (
+        mozphab.short_node("this-is-not-a-sha-this-is-not-a-sha-test")
+        == "this-is-not-a-sha-this-is-not-a-sha-test"
+    )
+    assert mozphab.short_node("b016b6080ff9") == "b016b6080ff9"
+    assert mozphab.short_node("b016b60") == "b016b60"
+    assert mozphab.short_node("mozilla-central") == "mozilla-central"
