@@ -15,6 +15,9 @@ mozphab = imp.load_source(
 )
 mozphab.SHOW_SPINNER = False
 
+# Fail if arc ping is called
+arc_ping = mock.Mock()
+arc_ping.return_value = False
 
 call_conduit = mock.Mock()
 call_conduit.side_effect = ({}, [{"userName": "alice", "phid": "PHID-USER-1"}])
@@ -27,9 +30,9 @@ def test_submit_create(in_process, hg_repo_path):
     call_conduit.side_effect = (
         # ping
         dict(),
-        [dict(userName="alice", phid="PHID-USER-1")],
         # diffusion.repository.search
         dict(data=[dict(phid="PHID-REPO-1", fields=dict(vcs="hg"))]),
+        [dict(userName="alice", phid="PHID-USER-1")],
         # differential.creatediff
         dict(dict(phid="PHID-DIFF-1", diffid="1")),
         # differential.setdiffproperty
@@ -102,7 +105,7 @@ Differential Revision: http://example.test/D123
                 "sourceMachine": "http://example.test",
                 "sourceControlBaseRevision": mock.ANY,
                 "repositoryPHID": "PHID-REPO-1",
-                "branch": "HEAD",
+                "branch": "default",
                 "changes": [
                     {
                         "currentPath": "A renamed",
@@ -110,14 +113,14 @@ Differential Revision: http://example.test/D123
                         "hunks": [
                             {
                                 "oldOffset": 1,
-                                "delLines": 0,
-                                "corpus": " rename me\n second line",
-                                "addLines": 0,
-                                "isMissingNewNewline": False,
-                                "newOffset": 1,
                                 "oldLength": 2,
+                                "newOffset": 1,
                                 "newLength": 2,
+                                "addLines": 0,
+                                "delLines": 0,
                                 "isMissingOldNewline": False,
+                                "isMissingNewNewline": False,
+                                "corpus": " rename me\n second line",
                             }
                         ],
                         "oldProperties": {},
@@ -147,13 +150,13 @@ Differential Revision: http://example.test/D123
                             {
                                 "oldOffset": 1,
                                 "oldLength": 1,
-                                "corpus": "-remove me",
-                                "isMissingOldNewline": False,
                                 "newOffset": 0,
                                 "newLength": 0,
                                 "addLines": 0,
                                 "delLines": 1,
+                                "isMissingOldNewline": False,
                                 "isMissingNewNewline": False,
+                                "corpus": "-remove me",
                             }
                         ],
                         "awayPaths": [],
@@ -169,18 +172,18 @@ Differential Revision: http://example.test/D123
                         "type": 2,  # CHANGE
                         "hunks": [
                             {
+                                "oldOffset": 1,
                                 "oldLength": 1,
-                                "isMissingOldNewline": False,
+                                "newOffset": 1,
+                                "newLength": 1,
+                                "addLines": 1,
+                                "delLines": 1,
+                                "isMissingOldNewline": True,
                                 "isMissingNewNewline": True,
                                 "corpus": (
                                     "-modify me\n\\ No newline at end of file\n"
-                                    "+modified\n\\ No newline at end of file"
+                                    "+modified\n\\ No newline at end of file\n"
                                 ),
-                                "addLines": 1,
-                                "newOffset": 1,
-                                "newLength": 1,
-                                "oldOffset": 1,
-                                "delLines": 1,
                             }
                         ],
                         "commitHash": mock.ANY,
@@ -227,10 +230,10 @@ def test_submit_create_binary(in_process, hg_repo_path, data_file):
     call_conduit.side_effect = (
         # ping
         dict(),
-        # file upload
-        dict(),
         # diffusion.repository.search
         dict(data=[dict(phid="PHID-REPO-1", fields=dict(vcs="hg"))]),
+        # file upload
+        dict(),
         # differential.creatediff
         dict(dict(phid="PHID-DIFF-1", diffid="1")),
         # differential.setdiffproperty
@@ -251,3 +254,100 @@ Bug 1 - IMG
 Differential Revision: http://example.test/D123
 """
     assert log.strip() == expected.strip()
+
+
+def test_submit_remove_cr(in_process, hg_repo_path):
+    call_conduit.side_effect = (
+        # CREATE
+        dict(),
+        dict(data=[dict(phid="PHID-REPO-1", fields=dict(vcs="hg"))]),
+        [dict(userName="alice", phid="PHID-USER-1")],
+        dict(dict(phid="PHID-DIFF-1", diffid="1")),
+        dict(),
+        dict(object=dict(id="123")),
+        # UPDATE
+        # no need to ping (checked)
+        # no need to check reviewer
+        # no need to search for repository repository data is saved in .hg
+        # differential.creatediff
+        dict(dict(phid="PHID-DIFF-2", diffid="2")),
+        # differential.setdiffproperty
+        dict(),
+        # differential.revision.edit
+        dict(object=dict(id="124")),
+    )
+    test_a = hg_repo_path / "X"
+    test_a.write_text("a\r\nb\n")
+    hg_out("add")
+    hg_out("commit", "--message", "A r?alice")
+    mozphab.main(["submit", "--no-arc", "--yes", "--bug", "1", "."])
+    call_conduit.reset_mock()
+    # removing CR, leaving LF
+    test_a.write_text("a\nb\n")
+    hg_out("commit", "--message", "B r?alice")
+    mozphab.main(["submit", "--no-arc", "--yes", "--bug", "1", "."])
+
+    assert (
+        mock.call(
+            "differential.creatediff",
+            {
+                "changes": [
+                    {
+                        "metadata": {},
+                        "oldPath": "X",
+                        "currentPath": "X",
+                        "awayPaths": [],
+                        "oldProperties": {},
+                        "newProperties": {},
+                        "commitHash": mock.ANY,
+                        "type": 2,
+                        "fileType": 1,
+                        "hunks": [
+                            {
+                                "oldOffset": 1,
+                                "oldLength": 2,
+                                "newOffset": 1,
+                                "newLength": 2,
+                                "addLines": 1,
+                                "delLines": 1,
+                                "isMissingOldNewline": False,
+                                "isMissingNewNewline": False,
+                                "corpus": "-a\r\n+a\n b\n",
+                            }
+                        ],
+                    }
+                ],
+                "sourceMachine": "http://example.test",
+                "sourceControlSystem": "hg",
+                "sourceControlPath": "/",
+                "sourceControlBaseRevision": mock.ANY,
+                "creationMethod": "moz-phab-hg",
+                "lintStatus": "none",
+                "unitStatus": "none",
+                "repositoryPHID": "PHID-REPO-1",
+                "sourcePath": mock.ANY,
+                "branch": "default",
+            },
+        )
+        in call_conduit.call_args_list
+    )
+    assert (
+        mock.call(
+            "differential.setdiffproperty",
+            {
+                "diff_id": "2",
+                "name": "local:commits",
+                "data": Contains('"summary": "Bug 1 - B r?alice"')
+                & Contains(
+                    '"message": "'
+                    "Bug 1 - B r?alice\\n\\n"
+                    "Summary:\\n\\n\\n\\n\\n"
+                    "Test Plan:\\n\\n"
+                    "Reviewers: alice\\n\\n"
+                    "Subscribers:\\n\\n"
+                    'Bug #: 1"'
+                ),
+            },
+        )
+        in call_conduit.call_args_list
+    )

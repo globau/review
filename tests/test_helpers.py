@@ -539,3 +539,34 @@ def test_short_node():
     assert mozphab.short_node("b016b6080ff9") == "b016b6080ff9"
     assert mozphab.short_node("b016b60") == "b016b60"
     assert mozphab.short_node("mozilla-central") == "mozilla-central"
+
+
+@mock.patch("os.path.expanduser")
+@mock.patch("os.path.isfile")
+@mock.patch("os.stat")
+@mock.patch("os.chmod")
+def test_get_arcrc_path(m_chmod, m_stat, m_isfile, m_expand):
+    arcrc = mozphab.get_arcrc_path
+
+    m_expand.return_value = "arcrc file"
+    m_isfile.return_value = False
+    arcrc()
+    m_chmod.assert_not_called()
+
+    class Stat:
+        st_mode = 0o100600
+
+    stat = Stat()
+    m_stat.return_value = stat
+    m_isfile.return_value = True
+
+    m_chmod.reset_mock()
+    mozphab.cache.reset()
+    arcrc()
+    m_chmod.assert_not_called()
+
+    m_chmod.reset_mock()
+    stat.st_mode = 0o100640
+    mozphab.cache.reset()
+    arcrc()
+    m_chmod.assert_called_once_with("arcrc file", 0o600)
