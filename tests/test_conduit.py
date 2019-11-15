@@ -35,7 +35,7 @@ args_query_testdata = [
     [dict(a="A", B="b"), [("B", "b"), ("a", "A")]],
     [dict(a=1), [("a", "1")]],
     [dict(arr=["a", 1, 2]), [("arr[0]", "a"), ("arr[1]", "1"), ("arr[2]", "2")]],
-    [dict(a=dict(b=[1])), [("a[b][0]", "1")]],
+    [dict(a=dict(b=[1]), b=dict(), c=list()), [("a[b][0]", "1"), ("b[]",), ("c[]",)]],
 ]
 
 
@@ -47,6 +47,7 @@ def test_json_args_to_query_params(args, params):
 @mock.patch("mozphab.read_json_field")
 def test_load_api_token(m_read):
     m_read.return_value = False
+    mozphab.conduit.set_repo(Repo())
     with pytest.raises(mozphab.ConduitAPIError):
         mozphab.conduit.load_api_token()
 
@@ -76,6 +77,14 @@ def test_call(m_token, m_urlopen, m_Request):
     m_Request.assert_called_with(
         "http://api_url/method", data=b"api.token=token&call=%C4%87wik%C5%82a"
     )
+
+    m_Request.reset_mock()
+    m_urlopen.reset_mock()
+    assert mozphab.conduit.call("method", dict(empty_dict={}, empty_list=[])) == "x"
+    m_Request.assert_called_once_with(
+        "http://api_url/method", data=b"api.token=token&empty_dict[]=&empty_list[]="
+    )
+    m_urlopen.assert_called_once()
 
     response.read.return_value = b'{"error_info": "x", "error_code": 1}'
 
@@ -283,7 +292,8 @@ def test_get_related_phids(m_call):
 @mock.patch("builtins.open")
 @mock.patch("mozphab.json")
 @mock.patch("mozphab.get_arcrc_path")
-def test_save_api_token(m_get_arcrc_path, m_json, m_open, git):
+@mock.patch("os.chmod")
+def test_save_api_token(m_chmod, m_get_arcrc_path, m_json, m_open, git):
     save_api_token = mozphab.conduit.save_api_token
 
     @contextmanager
@@ -297,13 +307,16 @@ def test_save_api_token(m_get_arcrc_path, m_json, m_open, git):
     with pytest.raises(PermissionError):
         save_api_token("abc")
 
+    m_chmod.reset_mock()
     m_open.side_effect = (FileNotFoundError, with_open())
     save_api_token("abc")
+    m_chmod.assert_called_once_with(".arcrc", 0o600)
 
     m_json.dump.assert_called_once_with(
         {"hosts": {git.api_url: {"token": "abc"}}}, mock.ANY, sort_keys=True, indent=2
     )
 
+    m_chmod.reset_mock()
     m_json.reset_mock()
     m_open.side_effect = None
     m_json.load.return_value = {"existing_key": "existing_value"}
@@ -314,6 +327,7 @@ def test_save_api_token(m_get_arcrc_path, m_json, m_open, git):
         sort_keys=True,
         indent=2,
     )
+    m_chmod.assert_not_called()
 
     m_json.reset_mock()
     m_json.load.return_value = {

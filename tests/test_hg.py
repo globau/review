@@ -157,7 +157,7 @@ def test_set_args(m_hg_hg_log, m_hg_hg_out, m_parse_config, m_config, hg):
     assert not hg.use_evolve
     assert hg.has_shelve
 
-    m_hg_hg_log.side_effect = [("1234567890123",), ("0987654321098",)]
+    m_hg_hg_log.side_effect = [("123456789012",), ("098765432109",)]
     hg._hg = []
     hg.set_args(Args())
     assert "123456789012::098765432109" == hg.revset
@@ -254,15 +254,18 @@ def test_before_patch(m_config, m_hg, m_hg_out, m_checkout, hg):
     m_hg_out.assert_not_called()
 
 
+@mock.patch("mozphab.temporary_binary_file")
 @mock.patch("mozphab.temporary_file")
 @mock.patch("mozphab.Mercurial.hg")
-def test_apply_patch(m_hg, m_temp_fn, hg):
-    m_temp_fn.return_value = create_temp_fn("diff_fn", "body_fn")
+def test_apply_patch(m_hg, m_temp_bin_fn, m_temp_fn, hg):
+    m_temp_bin_fn.return_value = create_temp_fn("body_fn")
+    m_temp_fn.return_value = create_temp_fn("diff_fn")
     hg.apply_patch("diff", "body", "user", 1)
     m_hg.assert_called_once_with(
         ["import", "diff_fn", "--quiet", "-l", "body_fn", "-u", "user", "-d", 1]
     )
-    assert m_temp_fn.call_count == 2
+    m_temp_bin_fn.assert_called_once()
+    m_temp_fn.assert_called_once()
 
 
 @mock.patch("mozphab.Mercurial.hg_out")
@@ -412,20 +415,19 @@ def test_change_mod(m_hg, m_hunk, m_binary, m_meta, hg):
         dict(binary=False, bin_body=b"def\n", body="def\n", file_size=4),
     )
     m_meta.side_effect = text_side_effect
-    m_hg.return_value = [
-        "diff --git a/fn b/fn\n",
-        "--- a/B\n",
-        "+++ b/B\n",
-        "@@ -1,1 +1,1 @@\n",
-        "-abc\n",
-        "+def\n",
-    ]
+    m_hg.return_value = b"""\
+diff --git a/fn b/fn
+--- a/B
++++ b/B
+@@ -1,1 +1,1 @@
+-abc
++def
+"""
     hg.args = Args()
     hg._change_mod(change, "fn", "old_fn", "parent", "node")
     m_hg.assert_called_once_with(
         ["diff", "--git", "-U%s" % mozphab.MAX_CONTEXT_SIZE, "-r", "parent", "fn"],
-        split=True,
-        keep_ends=True,
+        expect_binary=True,
     )
     m_hunk.assert_called_once_with(
         change, "fn", ["-abc\n", "+def\n"], 4, "parent", "node", 1, 1, 1, 1
@@ -436,7 +438,7 @@ def test_change_mod(m_hg, m_hunk, m_binary, m_meta, hg):
     hg.args = Args(lesscontext=True)
     hg._change_mod(change, "fn", "old_fn", "parent", "node")
     m_hg.assert_called_once_with(
-        ["diff", "--git", "-U100", "-r", "parent", "fn"], split=True, keep_ends=True
+        ["diff", "--git", "-U100", "-r", "parent", "fn"], expect_binary=True
     )
 
     m_hunk.reset_mock()
@@ -483,3 +485,19 @@ def test_get_file_modes(m_hg, hg):
     assert hg._get_file_modes(dict(node="aaa", parent="bbb")) == {
         "file name": dict(new_mode="100655")
     }
+
+
+def test_check_vcs(hg):
+    class Args:
+        def __init__(self, force_vcs=False):
+            self.force_vcs = force_vcs
+
+    hg.args = Args()
+    assert hg.check_vcs()
+
+    hg._vcs = "git"
+    with pytest.raises(mozphab.Error):
+        hg.check_vcs()
+
+    hg.args = Args(force_vcs=True)
+    assert hg.check_vcs()
