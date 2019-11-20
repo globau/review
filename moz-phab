@@ -1055,16 +1055,16 @@ class ConduitAPI:
         )
 
     def edit_revision(
-        self, transactions=[], diff_phid=None, rev_id=None, wip=False, force_wip=False
+        self, transactions=None, diff_phid=None, rev_id=None, wip=False, force_wip=False
     ):
         """Edit (create or update) a revision."""
-        trans = list(transactions)
+        trans = list(transactions or [])
         # diff_phid is not present for changes in revision settings (like WIP)
         if diff_phid:
             trans.append(dict(type="update", value=diff_phid))
 
+        set_wip_later = False
         if wip:
-            set_wip_later = False
             if rev_id and not force_wip:
                 # Set "changes planned" in a new request called after the update one.
                 # Phab API validation would return with an error if "changes planned
@@ -1472,7 +1472,8 @@ class Repository(object):
     def __init__(self, path, dot_path, phab_url=None):
         self._phid = None
         self._phab_repo = None
-        self._vcs = None
+        self._phab_vcs = None
+        self.vcs = None
         self.path = path  # base repository directory
         self.dot_path = dot_path  # .hg/.git directory
         self._arcconfig_files = [
@@ -1587,7 +1588,9 @@ class Repository(object):
     def apply_patch(self, diff, body, author, author_date):
         """Apply the patch and commit the changes."""
 
-    def check_commits_for_submit(self, commits, validate_reviewers=True):
+    def check_commits_for_submit(
+        self, commits, *, validate_reviewers=True, require_bug=True
+    ):
         """Validate the list of commits (from commit_stack) are ok to submit"""
         errors = []
         warnings = []
@@ -1624,11 +1627,9 @@ class Repository(object):
         for commit in commits:
             commit_errors = []
             commit_warnings = []
-            # TODO allow NOBUG in commit message (not in arg)
-            # TODO be more relaxed if we're updating an existing rev?
-            if not commit["bug-id"]:
-                commit_errors.append("missing bug-id")
 
+            if require_bug and not commit["bug-id"]:
+                commit_errors.append("missing bug-id")
             if has_arc_rejections(commit["body"]):
                 commit_errors.append("contains arc fields")
 
@@ -1752,18 +1753,18 @@ class Repository(object):
         This value does not change over time.
         It is stored in a file to avoid calling the API on every run.
         """
-        if not self._vcs:
+        if not self._phab_vcs:
             # check file
             path = os.path.join(self.dot_path, ".moz-phab_vcs")
             if os.path.isfile(path):
                 with open(path) as f:
-                    self._vcs = f.readline()
+                    self._phab_vcs = f.readline()
             else:
-                self._vcs = self.phab_repo["fields"]["vcs"]
+                self._phab_vcs = self.phab_repo["fields"]["vcs"]
                 with open(path, "w") as f:
-                    f.write(self._vcs)
+                    f.write(self._phab_vcs)
 
-        return self._vcs
+        return self._phab_vcs
 
     def get_public_node(self, node):
         """Hashtag in a remote VCS."""
@@ -1777,13 +1778,13 @@ class Repository(object):
 
 class Mercurial(Repository):
     def __init__(self, path):
-        self.vcs = "hg"
         dot_path = os.path.join(path, ".hg")
         if not os.path.isdir(dot_path):
             raise ValueError("%s: not a hg repository" % path)
         logger.debug("found hg repo in %s" % path)
 
         super().__init__(path, dot_path)
+        self.vcs = "hg"
 
         self._hg = ["hg.exe" if IS_WINDOWS else "hg"]
         self.revset = None
@@ -2291,7 +2292,9 @@ class Mercurial(Repository):
             + ["--dest", dest_commit["node"]]
         )
 
-    def check_commits_for_submit(self, commits, validate_reviewers=True):
+    def check_commits_for_submit(
+        self, commits, validate_reviewers=True, require_bug=True
+    ):
         # 'Greatest Common Ancestor'/'Merge Base' should be included in the revset.
         ancestor = self.hg_log("ancestor(%s)" % self.revset, split=False)
         if ancestor not in [c["node"] for c in commits]:
@@ -2633,8 +2636,6 @@ class Mercurial(Repository):
 
 class Git(Repository):
     def __init__(self, path):
-        self._cinnabar_installed = None
-        self.vcs = "git"
         dot_path = os.path.join(path, ".git")
         if not os.path.exists(dot_path):
             raise ValueError("%s: not a git repository" % path)
@@ -2656,6 +2657,8 @@ class Git(Repository):
 
         super().__init__(path, dot_path)
 
+        self.vcs = "git"
+        self._cinnabar_installed = None
         self.revset = None
         self.extensions = []
         self.branch = None
@@ -3678,6 +3681,9 @@ def show_commit_stack(
                     "   the owner."
                 )
 
+            if not commit["bug-id"]:
+                logger.warning("!! Missing Bug ID")
+
             if commit["bug-id-orig"] and commit["bug-id"] != commit["bug-id-orig"]:
                 logger.warning(
                     "!! Bug ID changed from %s to %s"
@@ -4130,7 +4136,9 @@ def submit(repo, args):
     show_commit_stack(commits, validate=True, ignore_reviewers=args.wip)
     try:
         with wait_message("Checking commits.."):
-            repo.check_commits_for_submit(commits, validate_reviewers=not args.wip)
+            repo.check_commits_for_submit(
+                commits, validate_reviewers=not args.wip, require_bug=not args.no_bug,
+            )
     except Error as e:
         if not args.force:
             raise Error("Unable to submit commits:\n\n%s" % e)
@@ -4834,6 +4842,11 @@ def parse_args(argv):
     )
     submit_parser.add_argument(
         "--bug", "-b", help="Set Bug ID for all commits (default: from commit)"
+    )
+    submit_parser.add_argument(
+        "--no-bug",
+        action="store_true",
+        help="Continue if a bug number is not provided.",
     )
     submit_parser.add_argument(
         "--reviewer",
