@@ -10,9 +10,8 @@ import shutil
 from callee import Contains
 from .conftest import hg_out
 
-mozphab = imp.load_source(
-    "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
-)
+from mozphab import mozphab
+
 mozphab.SHOW_SPINNER = False
 
 # Fail if arc ping is called
@@ -40,24 +39,21 @@ def test_submit_create(in_process, hg_repo_path):
         # differential.revision.edit
         dict(object=dict(id="123")),
     )
-    # test_a = hg_repo_path / "X"
-    # test_a.write_text("a")
-    # hg_out("add")
-    # hg_out("commit", "--message", "Ą r?alice")
-    # mozphab.main(["submit", "--no-arc", "--yes", "--bug", "1", "."])
-
     test_a = hg_repo_path / "A to rename"
     test_a.write_text("rename me\nsecond line")
     test_b = hg_repo_path / "B to remove"
     test_b.write_text("remove me")
     test_c = hg_repo_path / "C to modify"
     test_c.write_text("modify me")
+    test_d = hg_repo_path / "D to copy"
+    test_d.write_text("copy me")
     hg_out("add")
     hg_out("commit", "-m", "first")
     subdir = hg_repo_path / "subdir"
     subdir.mkdir()
-    test_d = hg_repo_path / "subdir" / "D add"
-    test_d.write_text("added")
+    hg_out("copy", "D to copy", "D copied")
+    test_e = hg_repo_path / "subdir" / "E add"
+    test_e.write_text("added")
     test_a.rename(hg_repo_path / "A renamed")
     test_b.unlink()
     test_c.write_text("modified")
@@ -65,7 +61,7 @@ def test_submit_create(in_process, hg_repo_path):
     msgfile = hg_repo_path / "msg"
     msgfile.write_text("Ą r?alice")
     hg_out("commit", "-l", "msg")
-    mozphab.main(["submit", "--no-arc", "--yes", "--bug", "1", "."])
+    mozphab.main(["submit", "--yes", "--bug", "1", "."])
 
     log = hg_out("log", "--template", r"{desc}\n", "--rev", ".")
     expected = """
@@ -195,7 +191,43 @@ Differential Revision: http://example.test/D123
                         "oldProperties": {},
                     },
                     {
-                        "currentPath": "subdir/D add",
+                        "metadata": {},
+                        "oldPath": "D to copy",
+                        "currentPath": "D copied",
+                        "awayPaths": [],
+                        "oldProperties": {},
+                        "newProperties": {},
+                        "commitHash": mock.ANY,
+                        "type": 7,  # COPY HERE
+                        "fileType": 1,
+                        "hunks": [
+                            {
+                                "oldOffset": 1,
+                                "oldLength": 1,
+                                "newOffset": 1,
+                                "newLength": 1,
+                                "addLines": 0,
+                                "delLines": 0,
+                                "isMissingOldNewline": False,
+                                "isMissingNewNewline": False,
+                                "corpus": " copy me",
+                            }
+                        ],
+                    },
+                    {
+                        "metadata": {},
+                        "oldPath": None,
+                        "currentPath": "D to copy",
+                        "awayPaths": ["D copied"],
+                        "oldProperties": {},
+                        "newProperties": {},
+                        "commitHash": mock.ANY,
+                        "type": 5,  # COPY AWAY
+                        "fileType": 1,
+                        "hunks": [],
+                    },
+                    {
+                        "currentPath": "subdir/E add",
                         "type": 1,  # ADD
                         "hunks": [
                             {
@@ -226,6 +258,36 @@ Differential Revision: http://example.test/D123
     )
 
 
+def test_submit_create_no_bug(in_process, hg_repo_path):
+    call_conduit.reset_mock()
+    call_conduit.side_effect = (
+        # ping
+        dict(),
+        # diffusion.repository.search
+        dict(data=[dict(phid="PHID-REPO-1", fields=dict(vcs="hg"))]),
+        [dict(userName="alice", phid="PHID-USER-1")],
+        # differential.creatediff
+        dict(dict(phid="PHID-DIFF-1", diffid="1")),
+        # differential.setdiffproperty
+        dict(),
+        # differential.revision.edit
+        dict(object=dict(id="123")),
+    )
+    test_a = hg_repo_path / "x"
+    test_a.write_text("a")
+    hg_out("add")
+    hg_out("commit", "--message", "A r?alice")
+    mozphab.main(["submit", "--yes", "--no-bug", "."])
+
+    log = hg_out("log", "--template", r"{desc}\n", "--rev", ".")
+    expected = """
+A r?alice
+
+Differential Revision: http://example.test/D123
+"""
+    assert log.strip() == expected.strip()
+
+
 def test_submit_create_binary(in_process, hg_repo_path, data_file):
     call_conduit.side_effect = (
         # ping
@@ -245,7 +307,7 @@ def test_submit_create_binary(in_process, hg_repo_path, data_file):
     hg_out("add")
     hg_out("commit", "-m", "IMG")
 
-    mozphab.main(["submit", "--no-arc", "--yes", "--bug", "1", "."])
+    mozphab.main(["submit", "--yes", "--bug", "1", "."])
 
     log = hg_out("log", "--template", r"{desc}\n", "--rev", ".")
     expected = """
@@ -280,12 +342,12 @@ def test_submit_remove_cr(in_process, hg_repo_path):
     test_a.write_text("a\r\nb\n")
     hg_out("add")
     hg_out("commit", "--message", "A r?alice")
-    mozphab.main(["submit", "--no-arc", "--yes", "--bug", "1", "."])
+    mozphab.main(["submit", "--yes", "--bug", "1", "."])
     call_conduit.reset_mock()
     # removing CR, leaving LF
     test_a.write_text("a\nb\n")
     hg_out("commit", "--message", "B r?alice")
-    mozphab.main(["submit", "--no-arc", "--yes", "--bug", "1", "."])
+    mozphab.main(["submit", "--yes", "--bug", "1", "."])
 
     assert (
         mock.call(

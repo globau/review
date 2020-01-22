@@ -4,27 +4,27 @@ import imp
 import mock
 import os
 import pytest
+from pathlib import Path
 
 from .conftest import create_temp_fn
 
-mozphab = imp.load_source(
-    "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
-)
+from mozphab import exceptions, mozphab
+
 mozphab.SHOW_SPINNER = False
 
 
-@mock.patch("mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git.git_out")
 def test_cherry(m_git_git_out, git):
-    m_git_git_out.side_effect = (mozphab.CommandError, ["output"])
+    m_git_git_out.side_effect = (exceptions.CommandError, ["output"])
     assert git._cherry(["cherry"], ["one", "two"]) == ["output"]
     m_git_git_out.assert_has_calls(
         [mock.call(["cherry", "one"]), mock.call(["cherry", "two"])]
     )
 
 
-@mock.patch("mozphab.Git.git_out")
-@mock.patch("mozphab.Git._cherry")
-@mock.patch("mozphab.config")
+@mock.patch("mozphab.mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git._cherry")
+@mock.patch("mozphab.mozphab.config")
 def test_first_unpublished(m_config, m_git_cherry, m_git_git_out, git):
     class Args:
         def __init__(self, upstream=None, start_rev="(auto)"):
@@ -39,7 +39,7 @@ def test_first_unpublished(m_config, m_git_cherry, m_git_git_out, git):
     assert "sha2" == first()
     m_git_cherry.assert_called_with(["cherry", "--abbrev=12"], ["a", "b"])
     assert first() is None
-    with pytest.raises(mozphab.Error):
+    with pytest.raises(exceptions.Error):
         first()
 
     m_git_cherry.side_effect = ([],)
@@ -56,11 +56,11 @@ def test_first_unpublished(m_config, m_git_cherry, m_git_git_out, git):
 
     m_git_cherry.side_effect = (["+ %s" % i for i in range(101)],)
     m_git_git_out.side_effect = (["origin"],)
-    with pytest.raises(mozphab.Error):
+    with pytest.raises(exceptions.Error):
         first()
 
 
-@mock.patch("mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git.git_out")
 def test_branches_to_rebase(m_git_git_out, git):
     git_find = git._find_branches_to_rebase
 
@@ -178,8 +178,8 @@ def test_is_child(git):
     assert not is_child("ccc", "ddd", nodes)
 
 
-@mock.patch("mozphab.Git.git_out")
-@mock.patch("mozphab.config")
+@mock.patch("mozphab.mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.config")
 def test_range(m_config, m_git_git_out, git):
     class Args:
         def __init__(self, start="aaa", end="."):
@@ -193,10 +193,10 @@ def test_range(m_config, m_git_git_out, git):
     assert git.revset == ("aaa", ".")
 
 
-@mock.patch("mozphab.config")
-@mock.patch("mozphab.parse_config")
-@mock.patch("mozphab.Git._get_first_unpublished_node")
-@mock.patch("mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.config")
+@mock.patch("mozphab.mozphab.parse_config")
+@mock.patch("mozphab.mozphab.Git._get_first_unpublished_node")
+@mock.patch("mozphab.mozphab.Git.git_out")
 def test_set_args(m_git_git_out, m_git_get_first, m_parse_config, m_config, git):
     class Args:
         def __init__(self, start="(auto)", end=".", safe_mode=False):
@@ -204,7 +204,7 @@ def test_set_args(m_git_git_out, m_git_get_first, m_parse_config, m_config, git)
             self.end_rev = end
             self.safe_mode = safe_mode
 
-    with pytest.raises(mozphab.Error):
+    with pytest.raises(exceptions.Error):
         git.set_args(Args())
 
     git._git = []
@@ -254,7 +254,7 @@ def test_set_args(m_git_git_out, m_git_get_first, m_parse_config, m_config, git)
     assert "" == git._env["XDG_CONFIG_HOME"]
 
 
-@mock.patch("mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git.git_out")
 def test_worktree_clean(m_git_out, git):
     m_git_out.return_value = ""
     assert git.is_worktree_clean()
@@ -269,7 +269,7 @@ def test_worktree_clean(m_git_out, git):
     assert not git.is_worktree_clean()
 
 
-@mock.patch("mozphab.Git.git")
+@mock.patch("mozphab.mozphab.Git.git")
 def test_commit(m_git, git):
     git.commit("some body")
     assert m_git.called_once()
@@ -279,9 +279,9 @@ def test_commit(m_git, git):
     assert m_git.called_once()
 
 
-@mock.patch("mozphab.Git._hg_to_git")
-@mock.patch("mozphab.Git.is_node")
-@mock.patch("mozphab.Git.phab_vcs")
+@mock.patch("mozphab.mozphab.Git._hg_to_git")
+@mock.patch("mozphab.mozphab.Git.is_node")
+@mock.patch("mozphab.mozphab.Git.phab_vcs")
 def test_check_node(m_phab_vcs, m_git_is_node, m_hg2git, git):
     node = "aabbcc"
     mozphab.conduit.set_repo(git)
@@ -290,18 +290,18 @@ def test_check_node(m_phab_vcs, m_git_is_node, m_hg2git, git):
     git._phab_vcs = "hg"
     git._cinnabar_installed = False
     m_git_is_node.return_value = False
-    with pytest.raises(mozphab.NotFoundError) as e:
+    with pytest.raises(exceptions.NotFoundError) as e:
         git.check_node(node)
     assert "Cinnabar extension not enabled" in str(e.value)
 
     git._cinnabar_installed = True
     m_hg2git.return_value = "0" * 40
-    with pytest.raises(mozphab.NotFoundError) as e:
+    with pytest.raises(exceptions.NotFoundError) as e:
         git.check_node(node)
     assert "Mercurial SHA1 not found" in str(e.value)
 
     m_hg2git.return_value = "git_aabbcc"
-    with pytest.raises(mozphab.NotFoundError) as e:
+    with pytest.raises(exceptions.NotFoundError) as e:
         git.check_node(node)
     assert "Mercurial SHA1 detected, but commit not found" in str(e.value)
 
@@ -309,11 +309,11 @@ def test_check_node(m_phab_vcs, m_git_is_node, m_hg2git, git):
     assert "git_aabbcc" == git.check_node(node)
 
 
-@mock.patch("mozphab.Git.git_out")
-@mock.patch("mozphab.Git.checkout")
-@mock.patch("mozphab.Git.git")
-@mock.patch("mozphab.prompt")
-@mock.patch("mozphab.logger")
+@mock.patch("mozphab.mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git.checkout")
+@mock.patch("mozphab.mozphab.Git.git")
+@mock.patch("mozphab.mozphab.prompt")
+@mock.patch("mozphab.mozphab.logger")
 def test_before_patch(m_logger, m_prompt, m_git, m_checkout, m_git_out, git):
     class Args:
         def __init__(
@@ -379,9 +379,9 @@ def test_before_patch(m_logger, m_prompt, m_git, m_checkout, m_git_out, git):
         git.before_patch("abcdef", "name")
 
 
-@mock.patch("mozphab.temporary_binary_file")
-@mock.patch("mozphab.Git.git")
-@mock.patch("mozphab.Git.commit")
+@mock.patch("mozphab.mozphab.temporary_binary_file")
+@mock.patch("mozphab.mozphab.Git.git")
+@mock.patch("mozphab.mozphab.Git.commit")
 def test_apply_patch(m_commit, m_git, m_temp_fn, git):
     m_temp_fn.return_value = create_temp_fn("filename")
     git.apply_patch("diff", "commit message", "user", 1)
@@ -390,7 +390,7 @@ def test_apply_patch(m_commit, m_git, m_temp_fn, git):
     m_temp_fn.assert_called_once_with(b"diff")
 
 
-@mock.patch("mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git.git_out")
 def test_is_node(m_git_out, git):
     m_git_out.return_value = "commit"
     assert git.is_node("aaa")
@@ -398,13 +398,18 @@ def test_is_node(m_git_out, git):
     m_git_out.return_value = "something else"
     assert not git.is_node("aaa")
 
-    m_git_out.side_effect = mozphab.CommandError
+    m_git_out.side_effect = exceptions.CommandError
     assert not git.is_node("aaa")
 
 
-@mock.patch("mozphab.Git.git_out")
-def test_is_cinnabar_installed(m_git_out, git):
-    # cinnabar installed
+@mock.patch("mozphab.mozphab.which")
+@mock.patch("mozphab.mozphab.Git.git_out")
+def test_is_cinnabar_installed(m_git_out, m_which, git, tmp_path):
+    def _without_str(calls):
+        # Debuggers call __str__ on mocked functions, strip them
+        return [c for c in calls if c[0] != "__str__"]
+
+    # cinnabar installed as visible external command
     m_git_out.return_value = ["External commands", "   cinnabar", "   revise"]
     assert git.is_cinnabar_installed
     m_git_out.assert_called_once_with(["help", "--all"])
@@ -415,15 +420,57 @@ def test_is_cinnabar_installed(m_git_out, git):
     assert git.is_cinnabar_installed
     m_git_out.assert_not_called()
 
+    # create a fake cinnabar in exec-path for git to find
+    cinnabar = Path(tmp_path) / "git-cinnabar"
+    cinnabar.write_text("")
+    cinnabar.chmod(0o755)
+
+    # cinnabar installed in exec-path
+    m_git_out.reset_mock()
+    m_git_out.side_effect = [
+        ["External commands", "   revise"],  # git help --all
+        tmp_path,  # git --exec-path
+    ]
+    git._cinnabar_installed = None
+    assert git.is_cinnabar_installed
+    assert _without_str(m_git_out.mock_calls) == [
+        mock.call(["help", "--all"]),
+        mock.call(["--exec-path"], split=False),
+    ]
+
+    # remove cinnabar from exec-path so we fall back to looking on the path
+    cinnabar.unlink()
+
+    # cinnabar installed somewhere on path
+    m_git_out.reset_mock()
+    m_git_out.side_effect = [
+        ["External commands", "   revise"],  # git help --all
+        tmp_path,  # git --exec-path
+    ]
+    m_which.return_value = str(cinnabar)
+    git._cinnabar_installed = None
+    assert git.is_cinnabar_installed
+    assert _without_str(m_git_out.mock_calls) == [
+        mock.call(["help", "--all"]),
+        mock.call(["--exec-path"], split=False),
+    ]
+
     # cinnabar not installed
     m_git_out.reset_mock()
-    m_git_out.return_value = ["External commands", "   revise"]
+    m_git_out.side_effect = [
+        ["External commands", "   revise"],  # git help --all
+        tmp_path,  # git --exec-path
+    ]
+    m_which.return_value = None
     git._cinnabar_installed = None
     assert not git.is_cinnabar_installed
-    m_git_out.assert_called_once_with(["help", "--all"])
+    assert _without_str(m_git_out.mock_calls) == [
+        mock.call(["help", "--all"]),
+        mock.call(["--exec-path"], split=False),
+    ]
 
 
-@mock.patch("mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git.git_out")
 def test_unicode_in_windows_env(m_git_out, git, monkeypatch):
     monkeypatch.setattr(mozphab, "IS_WINDOWS", True)
     git._commit_tree("parent", "tree_hash", "message", "ćwikła", "ćwikła", "date")
@@ -449,7 +496,7 @@ def test_check_vcs(git):
     assert git.check_vcs()
 
     git._cinnabar_installed = False
-    with pytest.raises(mozphab.Error):
+    with pytest.raises(exceptions.Error):
         git.check_vcs()
 
     git.args = Args(force_vcs=True)

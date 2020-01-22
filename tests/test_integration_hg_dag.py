@@ -7,9 +7,8 @@ import mock
 
 from .conftest import hg_out
 
-mozphab = imp.load_source(
-    "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
-)
+from mozphab import mozphab
+
 mozphab.SHOW_SPINNER = False
 
 
@@ -39,12 +38,12 @@ def _checkout(repo, name):
     hg_out("update", repo["rev_map"][name])
 
 
-def _submit(repo, start, end, expected):
+def _submit(repo, start, end, expected, wip=False):
     mozphab.main(
         [
             "submit",
-            "--no-arc",
             "--yes",
+            *(["--wip"] if wip else []),
             "--bug",
             "1",
             repo["rev_map"][start],
@@ -76,6 +75,38 @@ def _conduit_side_effect(calls=1):
         )
 
     return side_effect
+
+
+def test_submit_wip(in_process, hg_repo_path):
+    repo = _init_repo(hg_repo_path)
+
+    call_conduit.side_effect = _conduit_side_effect()  # TODO verify bool
+
+    _add_commit(repo, "R0", "A1")
+    _submit(
+        repo,
+        "A1",
+        "A1",
+        """
+@  Bug 1 - A1
+|
+o  R0
+|
+o  init
+""",
+        wip=True,
+    )
+    edit_call = next(
+        call
+        for call in call_conduit.mock_calls
+        if call.args[0] == "differential.revision.edit"
+    )
+    wip_transaction = next(
+        transaction
+        for transaction in edit_call.args[1]["transactions"]
+        if transaction["type"] == "plan-changes"
+    )
+    assert wip_transaction["value"] == True
 
 
 def test_submit_single_1(in_process, hg_repo_path):

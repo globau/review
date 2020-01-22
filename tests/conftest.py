@@ -11,9 +11,7 @@ import sys
 
 from pathlib import Path
 
-mozphab = imp.load_source(
-    "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
-)
+from mozphab import mozphab
 
 
 def create_temp_fn(*filenames):
@@ -26,6 +24,15 @@ def create_temp_fn(*filenames):
     return m_temp_fn
 
 
+def get_sha():
+    return git_out("log", "--format=%H", "-1").rstrip("\n")
+
+
+@pytest.fixture
+def init_sha(in_process, git_repo_path):
+    return get_sha()
+
+
 @pytest.fixture(autouse=True)
 def reset_cache():
     mozphab.cache.reset()
@@ -33,7 +40,7 @@ def reset_cache():
 
 @pytest.fixture()
 def repo_phab_url():
-    with mock.patch("mozphab.Repository._phab_url") as xmock:
+    with mock.patch("mozphab.mozphab.Repository._phab_url") as xmock:
         xmock.return_value = "http://phab.test"
         yield xmock
 
@@ -44,12 +51,12 @@ def data_file():
 
 
 @pytest.fixture
-@mock.patch("mozphab.Git.git_out")
-@mock.patch("mozphab.Git._get_current_head")
-@mock.patch("mozphab.Config")
-@mock.patch("mozphab.os.path")
-@mock.patch("mozphab.which")
-@mock.patch("mozphab.read_json_field")
+@mock.patch("mozphab.mozphab.Git.git_out")
+@mock.patch("mozphab.mozphab.Git._get_current_head")
+@mock.patch("mozphab.mozphab.Config")
+@mock.patch("mozphab.mozphab.os.path")
+@mock.patch("mozphab.mozphab.which")
+@mock.patch("mozphab.mozphab.read_json_field")
 def git(
     m_read_json_field,
     m_which,
@@ -71,11 +78,11 @@ def git(
 
 
 @pytest.fixture
-@mock.patch("mozphab.Mercurial.hg_out")
-@mock.patch("mozphab.Config")
-@mock.patch("mozphab.os.path")
-@mock.patch("mozphab.which")
-@mock.patch("mozphab.read_json_field")
+@mock.patch("mozphab.mozphab.Mercurial.hg_out")
+@mock.patch("mozphab.mozphab.Config")
+@mock.patch("mozphab.mozphab.os.path")
+@mock.patch("mozphab.mozphab.which")
+@mock.patch("mozphab.mozphab.read_json_field")
 def hg(
     m_read_json_field,
     m_which,
@@ -124,6 +131,23 @@ def hg_repo_path(monkeypatch, tmp_path):
     with open(".hg/hgrc", "a") as f:
         f.write("\n[experimental]\ngraphshorten = false\n")
     return repo_path
+
+
+@pytest.fixture
+def fresh_global_config(tmp_path):
+    """Overrides global ~/.gitconfig by creating a tiny one in the temp repo and setting it as the $HOME"""
+    original_env = os.environ.copy()
+    env = os.environ
+    env["HOME"] = str(tmp_path)
+    with open("{}/.gitconfig".format(tmp_path), "w") as f:
+        f.write("[user]\n\tname = Developer\n\temail = developer@mozilla.com\n")
+    with open("{}/.hgrc".format(tmp_path), "w") as f:
+        f.write(
+            "[ui]\nusername = Developer <developer@mozilla.com>\n[extensions]\nevolve =\n"
+        )
+    yield
+    os.environ.clear()
+    os.environ.update(original_env)
 
 
 def git_out(*args):

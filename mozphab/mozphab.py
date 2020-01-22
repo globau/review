@@ -6,7 +6,7 @@
 # coding=utf-8
 
 """
-Wrapper around Phabricator's `arc` cli to support submission of a series of commits.
+CLI to support submission of a series of commits to Phabricator. .
 """
 
 import argparse
@@ -23,7 +23,6 @@ import operator
 import os
 import re
 import signal
-import site
 import subprocess
 import stat
 import sys
@@ -35,22 +34,30 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import uuid
+import __main__ as script_module
 from collections import namedtuple
 from contextlib import contextmanager, suppress
+from distutils.dist import Distribution
 from distutils.version import LooseVersion
 from glob import glob
 from pathlib import Path
 from pkg_resources import get_distribution, parse_version
 from shlex import quote
 from shutil import which
+from http.client import HTTPConnection, HTTPSConnection
+
+from .exceptions import (
+    CommandError,
+    ConduitAPIError,
+    Error,
+    NonLinearException,
+    NotFoundError,
+)
+
+from .reorganise import stack_transactions, walk_llist
+
 
 # Known Issues
-# - reordering, folding, etc commits doesn't result in the stack being updated
-#   correctly on phabricator, or may outright fail due to dependency loops.
-#   to address this we'll need to query phabricator's api directly and clear
-#   dependencies prior to calling arc. we'd probably also have to
-#   abandon revisions that are no longer part of the stack.  unfortunately
-#   phabricator's api currently doesn't expose calls to do this.
 # - commits with a description already modified by arc (ie. the follow the arc commit
 #   description template with 'test plan', subscribers, etc) are not handled by this
 #   script.  commits in this format should be detected and result in the commit being
@@ -61,6 +68,7 @@ from shutil import which
 # Environment Vars
 
 DEBUG = bool(os.getenv("DEBUG"))
+HTTP_ALLOWED = bool(os.getenv("HTTP_ALLOWED"))
 IS_WINDOWS = sys.platform == "win32"
 HAS_ANSI = (
     not IS_WINDOWS
@@ -233,7 +241,7 @@ def which_path(path):
         and os.access(path, os.F_OK | os.X_OK)
         and not os.path.isdir(path)
     ):
-        logger.debug("Path found: {}".format(path))
+        logger.debug("Path found: %s", path)
         return path
 
     return which(path)
@@ -246,7 +254,7 @@ def parse_zulu_time(timestamp):
 
 def check_call(command, **kwargs):
     # wrapper around subprocess.check_call with debug output
-    logger.debug("$ %s" % " ".join(quote(s) for s in command))
+    logger.debug("$ %s", " ".join(quote(s) for s in command))
     try:
         subprocess.check_call(command, **kwargs)
     except subprocess.CalledProcessError as e:
@@ -257,7 +265,7 @@ def check_call(command, **kwargs):
 
 def check_call_by_line(command, cwd=None, never_log=False):
     # similar to check_call, yields for line-by-line processing
-    logger.debug("$ %s" % " ".join(quote(s) for s in command))
+    logger.debug("$ %s", " ".join(quote(s) for s in command))
 
     # Connecting the STDIN to the PIPE will make arc throw an exception on reading
     # user input
@@ -272,7 +280,7 @@ def check_call_by_line(command, cwd=None, never_log=False):
         for line in iter(process.stdout.readline, ""):
             line = line.rstrip()
             if not never_log:
-                logger.debug("> %s" % line)
+                logger.debug("> %s", line)
             yield line
     finally:
         process.stdout.close()
@@ -299,7 +307,7 @@ def check_output(
     expect_binary=False,
 ):
     # wrapper around subprocess.check_output with debug output and splitting
-    logger.debug("$ %s" % " ".join(quote(s) for s in command))
+    logger.debug("$ %s", " ".join(quote(s) for s in command))
     kwargs = dict(cwd=cwd, stdin=stdin, stderr=stderr)
     if not expect_binary:
         kwargs["universal_newlines"] = True
@@ -326,7 +334,7 @@ def check_output(
         )
 
     if expect_binary:
-        logger.debug("%s bytes of data received" % len(output))
+        logger.debug("%s bytes of data received", len(output))
         return output
 
     if strip:
@@ -529,30 +537,6 @@ def wait_message(message):
             sys.exit(3)
 
 
-class Error(Exception):
-    """Errors thrown explictly by this script; won't generate a stack trace."""
-
-
-class NotFoundError(Exception):
-    """Errors raised when node is not found."""
-
-
-class NonLinearException(Exception):
-    """Errors raised when multiple children or parents found."""
-
-
-class CommandError(Exception):
-    status = None
-
-    def __init__(self, msg="", status=1):
-        self.status = status
-        super().__init__(msg)
-
-
-class ConduitAPIError(Error):
-    """Raised when the Phabricator Conduit API returns an error response."""
-
-
 #
 # Configuration
 #
@@ -627,7 +611,7 @@ class Config(object):
 
     def write(self):
         if os.path.exists(self._filename):
-            logger.debug("updating %s" % self._filename)
+            logger.debug("updating %s", self._filename)
             self._set("submit", "auto_submit", self.auto_submit)
             self._set("patch", "always_full_stack", self.always_full_stack)
             self._set("updater", "self_last_check", self.self_last_check)
@@ -635,7 +619,7 @@ class Config(object):
             self._set("updater", "self_auto_update", self.self_auto_update)
 
         else:
-            logger.debug("creating %s" % self._filename)
+            logger.debug("creating %s", self._filename)
             self._set("ui", "no_ansi", self.no_ansi)
             self._set("vcs", "safe_mode", self.safe_mode)
             self._set("git", "remote", ", ".join(self.git_remote))
@@ -653,46 +637,6 @@ class Config(object):
 #
 # Conduit
 #
-
-
-def json_args_to_query_params(args):
-    """Convert JSON arguments for Conduit API to query parameters.
-
-    Args:
-        args: JSON arguments.
-
-    Returns:
-        A list that contains query parameters as key-value pair tuple.
-
-        The order of items in the list is important.
-        An array `names = ['foo', 'bar']` is converted to
-        `[('names[0]', 'foo'), ('names[1]', 'bar')` and it should be sent as
-        `names[0]=foo&names[1]=bar`.
-        If it's sent as `names[1]=foo&names[0]=bar`, it means an object
-        `names = { 1: 'foo', 0: 'bar' }`.
-    """
-    params = []
-
-    def convert(path, v):
-        if type(v) == list:
-            if len(v) > 0:
-                for (index, elem) in enumerate(v):
-                    convert("{}[{}]".format(path, index), elem)
-            else:
-                params.append(("{}[]".format(path),))
-        elif type(v) == dict:
-            if v:
-                for (k, val) in v.items():
-                    convert("{}[{}]".format(path, k), val)
-            else:
-                params.append(("{}[]".format(path),))
-        else:
-            params.append((path, str(v)))
-
-    for key in sorted(args.keys()):
-        convert(key, args[key])
-
-    return params
 
 
 class ConduitAPI:
@@ -752,30 +696,35 @@ class ConduitAPI:
         Raises:
             ConduitAPIError if the API threw an error back at us.
         """
-        url = urllib.parse.urljoin(self.repo.api_url, api_method)
-        logger.debug("%s %s" % (url, api_call_args))
+        url = urllib.parse.urlparse(urllib.parse.urljoin(self.repo.api_url, api_method))
+        logger.debug("%s %s", url.geturl(), api_call_args)
 
-        # Manually concatenate query parameters because Conduit doesn't accept
-        # URL encoded parameter names.
         api_call_args = api_call_args.copy()
-        api_call_args["api.token"] = self.load_api_token()
-        api_call_params = json_args_to_query_params(api_call_args)
-        data_arr = []
-        for p in api_call_params:
-            data_arr.append(
-                "{}={}".format(p[0], urllib.parse.quote(p[1].encode(encoding="utf-8")))
-                if len(p) == 2
-                else "{}=".format(p[0])
+        api_call_args["__conduit__"] = {"token": self.load_api_token()}
+        body = urllib.parse.urlencode(
+            {
+                "params": json.dumps(api_call_args),
+                "output": "json",
+                "__conduit__": True,
+            }
+        )
+        # Send the POST request
+        if url.scheme == "https":
+            conn = HTTPSConnection(url.netloc)
+        elif HTTP_ALLOWED:
+            # Allow for an HTTP connection in suite.
+            conn = HTTPConnection(url.netloc)
+        else:
+            raise CommandError("Only https connections are allowed.")
+
+        conn.request("POST", url.geturl(), body=body)
+
+        # Read the response as JSON
+        response = json.loads(conn.getresponse().read().decode("utf-8"))
+        if response["error_code"]:
+            raise ConduitAPIError(
+                response.get("error_info", "Error %s" % response["error_code"])
             )
-        data = "&".join(data_arr).encode(encoding="utf-8")
-
-        output = urllib.request.urlopen(
-            urllib.request.Request(url, data=data), timeout=30
-        ).read()
-        response = json.loads(output.decode("utf-8"))
-
-        if response["error_code"] and response["error_info"]:
-            raise ConduitAPIError(response["error_info"])
 
         return response["result"]
 
@@ -789,7 +738,8 @@ class ConduitAPI:
         except ConduitAPIError as err:
             logger.error(err)
             return False
-        except CommandError:
+        except CommandError as err:
+            logger.error(err)
             return False
         return True
 
@@ -807,6 +757,44 @@ class ConduitAPI:
             return True
 
         return False
+
+    def ids_to_phids(self, rev_ids):
+        """Convert revision ids to PHIDs.
+
+        Parameters:
+            rev_ids (list): A list of revision ids
+
+        Returns:
+            A list of PHIDs.
+        """
+        return [r["phid"] for r in self.get_revisions(ids=rev_ids)]
+
+    def id_to_phid(self, rev_id):
+        """Convert revision id to PHID."""
+        phids = self.ids_to_phids([rev_id])
+        if phids:
+            return phids[0]
+
+        raise NotFoundError("revision {} not found".format(rev_id))
+
+    def phids_to_ids(self, phids):
+        """Convert revision PHIDs to ids.
+
+        Parameteres:
+            phids (list): A list of PHIDs
+
+        Returns:
+            A list of ids.
+        """
+        return ["D{}".format(r["id"]) for r in self.get_revisions(phids=phids)]
+
+    def phid_to_id(self, phid):
+        """Convert revision PHID to id."""
+        ids = self.phids_to_ids([phid])
+        if ids:
+            return ids[0]
+
+        raise NotFoundError("revision {} not found".format(phid))
 
     def get_revisions(self, ids=None, phids=None):
         """Get revisions info from Phabricator.
@@ -934,6 +922,51 @@ class ConduitAPI:
             if r["fields"]["status"]["value"] != "abandoned"
         ]
 
+    def get_stack(self, rev_ids):
+        """Returns a dict of PHIDs."""
+        phids = set()
+        if not rev_ids:
+            return {}
+        revisions = self.get_revisions(ids=rev_ids)
+        new_phids = set([rev["phid"] for rev in revisions])
+        stack = {}
+
+        while new_phids:
+            phids.update(new_phids)
+
+            edges = self.call(
+                "edge.search",
+                dict(
+                    sourcePHIDs=list(new_phids),
+                    types=["revision.parent", "revision.child"],
+                    limit=10000,
+                ),
+            )["data"]
+
+            new_phids = set()
+            for edge in edges:
+                new_phids.add(edge["sourcePHID"])
+                new_phids.add(edge["destinationPHID"])
+
+                if edge["edgeType"] == "revision.child":
+                    if edge["sourcePHID"] in stack:
+                        source_id = next(
+                            r["id"]
+                            for r in revisions
+                            if r["phid"] == edge["sourcePHID"]
+                        )
+                        raise Error("Revision D%s has multiple children." % source_id)
+
+                    stack[edge["sourcePHID"]] = edge["destinationPHID"]
+
+            new_phids = new_phids - phids
+
+        for child in list(stack.values()):
+            # set the last child (not a parent)
+            stack.setdefault(child)
+
+        return stack
+
     def get_users(self, usernames):
         """Get users using the user.query API.
 
@@ -1012,7 +1045,8 @@ class ConduitAPI:
         if has_commit_reviewers and not wip:
             update_revision_reviewers(transactions, commit)
 
-        transactions.append(dict(type="bugzilla.bug-id", value=commit["bug-id"]))
+        if commit["bug-id"]:
+            transactions.append(dict(type="bugzilla.bug-id", value=commit["bug-id"]))
         return self.edit_revision(
             transactions=transactions, diff_phid=diff_phid, wip=wip
         )
@@ -1043,9 +1077,12 @@ class ConduitAPI:
                 update_revision_reviewers(transactions, commit)
 
         # Update bug id if different
-        revision = conduit.get_revisions(ids=[int(commit["rev-id"])])[0]
-        if revision["fields"]["bugzilla.bug-id"] != commit["bug-id"]:
-            transactions.append(dict(type="bugzilla.bug-id", value=commit["bug-id"]))
+        if commit["bug-id"]:
+            revision = conduit.get_revisions(ids=[int(commit["rev-id"])])[0]
+            if revision["fields"]["bugzilla.bug-id"] != commit["bug-id"]:
+                transactions.append(
+                    dict(type="bugzilla.bug-id", value=commit["bug-id"])
+                )
 
         return self.edit_revision(
             transactions=transactions,
@@ -1075,7 +1112,7 @@ class ConduitAPI:
                 )
 
         if force_wip or wip and not set_wip_later:
-            trans.append(dict(type="plan-changes", value="true"))
+            trans.append(dict(type="plan-changes", value=True))
 
         api_call_args = dict(transactions=trans)
 
@@ -1341,6 +1378,7 @@ class Diff:
                 old.kind = self.Kind("MULTICOPY")
             elif old.kind.name != "MULTICOPY":
                 old.kind = self.Kind("MOVE_AWAY")
+
             old.away_paths.append(change.cur_path)
 
         elif kind == "C":
@@ -1351,10 +1389,11 @@ class Diff:
 
             change.old_path = a_path
             old = self.change_for(change.old_path)
-            if old.kind.name == "MOVE_AWAY":
+            if old.kind.name in ["MOVE_AWAY", "COPY_AWAY"]:
                 old.kind = self.Kind("MULTICOPY")
-            else:
-                old.kind.name = self.Kind("COPY_AWAY")
+            elif old.kind.name != "MULTICOPY":
+                old.kind = self.Kind("COPY_AWAY")
+
             old.away_paths.append(change.cur_path)
 
         else:
@@ -1461,7 +1500,7 @@ def get_arcrc_path():
     else:
         arcrc = os.path.expanduser("~/.arcrc")
         if os.path.isfile(arcrc) and stat.S_IMODE(os.stat(arcrc).st_mode) != 0o600:
-            logger.debug("Changed file permissions on the {} file.".format(arcrc))
+            logger.debug("Changed file permissions on the %s file.", arcrc)
             os.chmod(arcrc, 0o600)
 
     cache.set("arcrc", arcrc)
@@ -1515,8 +1554,10 @@ class Repository(object):
         else:
             defaults_files.append("/etc/arcconfig")
 
-        phab_url = self._get_setting("phabricator.uri") or read_json_field(
-            defaults_files, ["config", "default"]
+        phab_url = (
+            self._get_setting("phabricator.uri")
+            or self._get_setting("conduit_uri")
+            or read_json_field(defaults_files, ["config", "default"])
         )
 
         if not phab_url:
@@ -1600,8 +1641,25 @@ class Repository(object):
         all_reviewers = {}
         reviewer_commit_map = {}
         commit_invalid_reviewers = {}
+        rev_ids_to_names = dict()
         for commit in commits:
             commit_invalid_reviewers[commit["node"]] = []
+
+            if not commit["rev-id"]:
+                continue
+            names = rev_ids_to_names.setdefault(commit["rev-id"], [])
+            names.append(commit["name"])
+
+        for rev_id, names in rev_ids_to_names.items():
+            if len(names) < 2:
+                continue
+
+            error_msg = "Phabricator revisions should be unique, but the following commits refer to the same one (D{}):\n".format(
+                rev_id
+            )
+            for name in names:
+                error_msg += "* %s\n" % name
+            errors.append(error_msg)
 
         if validate_reviewers:
             # Flatten and deduplicate reviewer list, keeping track of the
@@ -1781,7 +1839,7 @@ class Mercurial(Repository):
         dot_path = os.path.join(path, ".hg")
         if not os.path.isdir(dot_path):
             raise ValueError("%s: not a hg repository" % path)
-        logger.debug("found hg repo in %s" % path)
+        logger.debug("found hg repo in %s", path)
 
         super().__init__(path, dot_path)
         self.vcs = "hg"
@@ -2096,7 +2154,7 @@ class Mercurial(Repository):
                     "If you continue with `--force-delete` the %s" % msg
                 )
             else:
-                logger.warning("`--force-delete` used. The %s" % msg)
+                logger.warning("`--force-delete` used. The %s", msg)
 
         return commits
 
@@ -2134,7 +2192,7 @@ class Mercurial(Repository):
             with wait_message("Checking out %s.." % short_node(node)):
                 self.checkout(node)
             if not self.args.raw:
-                logger.info("Checked out %s" % short_node(node))
+                logger.info("Checked out %s", short_node(node))
 
         if name and config.create_bookmark and not self.args.no_bookmark:
             bookmarks = self.hg_out(["bookmarks", "-T", "{bookmark}\n"])
@@ -2146,7 +2204,7 @@ class Mercurial(Repository):
 
             self.hg(["bookmark", bookmark_name])
             if not self.args.raw:
-                logger.info("Bookmark set to %s" % bookmark_name)
+                logger.info("Bookmark set to %s", bookmark_name)
 
     def apply_patch(self, diff, body, author, author_date):
         commands = []
@@ -2196,7 +2254,7 @@ class Mercurial(Repository):
             ["log", "-T", "{desc}", "-r", commit["node"]], split=False
         )
         if current_body == updated_body:
-            logger.debug("not amending commit %s, unchanged" % commit["name"])
+            logger.debug("not amending commit %s, unchanged", commit["name"])
             return False
 
         # Find our position in the stack.
@@ -2311,8 +2369,9 @@ class Mercurial(Repository):
             (phase, node) = parent.split(" ", 1)
             if phase != "public":
                 logger.warning(
-                    "%s is based off non-public commit %s"
-                    % (short_node(ancestor), short_node(node))
+                    "%s is based off non-public commit %s",
+                    short_node(ancestor),
+                    short_node(node),
                 )
 
         # Can't submit merge requests.
@@ -2340,7 +2399,9 @@ class Mercurial(Repository):
                 err.append("You can enable the shelve extension via `hg config --edit`")
             raise Error("\n".join(err))
 
-        super().check_commits_for_submit(commits, validate_reviewers=validate_reviewers)
+        super().check_commits_for_submit(
+            commits, validate_reviewers=validate_reviewers, require_bug=require_bug
+        )
 
     def _get_file_modes(self, commit):
         """Get modes of the modified files."""
@@ -2397,20 +2458,26 @@ class Mercurial(Repository):
         ]
         changes = []
 
-        # Converting to tuples as `fn_copies` returns a "new filename (old filename)"
         fn_renames = []
+        fn_renamed = []  # collection of `old_fn`.
+        # fn_renames_str is returning "new filename (old filename)"
         for fn in fn_renames_str:
             m = re.match(r"(?P<filename>[^(]+) \((?P<old_filename>[^)]+)\)", fn)
             if m:
+                old_fn = m.group("old_filename")
+                new_fn = m.group("filename")
+                # A file can be mved only once.
+                is_move = old_fn in fn_dels and old_fn not in fn_renamed
                 changes.append(
                     dict(
-                        fn=m.group("filename"),
-                        old_fn=m.group("old_filename"),
-                        kind="R",
+                        fn=new_fn,
+                        old_fn=old_fn,
+                        kind="R" if is_move else "C",
                         func=self._change_mod,
                     )
                 )
-                fn_renames.append((m.group("filename"), m.group("old_filename")))
+                fn_renames.append((new_fn, old_fn))
+                fn_renamed.append(old_fn)
 
         # remove renames from adds and dels
         fn_adds = [fn for fn in fn_adds if fn and fn not in [c[0] for c in fn_renames]]
@@ -2551,9 +2618,9 @@ class Mercurial(Repository):
 
                 if file_size > MAX_CONTEXT_SIZE / 2:
                     logger.debug(
-                        "Splitting the diff (size: {size}) took {delta}s".format(
-                            size=file_size, delta=time.process_time() - start
-                        )
+                        "Splitting the diff (size: %s) took %ss",
+                        file_size,
+                        time.process_time() - start,
                     )
 
                 old_off, new_off, old_len, new_len = Diff.parse_git_diff(lines.pop(0))
@@ -2640,7 +2707,7 @@ class Git(Repository):
         if not os.path.exists(dot_path):
             raise ValueError("%s: not a git repository" % path)
 
-        logger.debug("found git repo in %s" % path)
+        logger.debug("found git repo in %s", path)
 
         self._git = GIT_COMMAND[:]
         if not which_path(self._git[0]):
@@ -2667,12 +2734,25 @@ class Git(Repository):
     def is_cinnabar_installed(self):
         """Check if Cinnabar extension is callable."""
         if self._cinnabar_installed is None:
+            # Unfortunately we cannot use --list-cmds as it requires git v2.18+
+
+            # Normally cinnabar will be listed in the 'External commands' section.
             for line in self.git_out(["help", "--all"]):
                 if re.search(r"^\s+cinnabar\b", line):
                     self._cinnabar_installed = True
                     break
-            else:
-                self._cinnabar_installed = False
+
+            # Cinnabar might be installed in git's exec-path, which won't be
+            # included in the `git help --all` output, nor is it necessarily
+            # on the path.
+            if not self._cinnabar_installed:
+                exec_path = Path(self.git_out(["--exec-path"], split=False))
+                if (exec_path / "git-cinnabar").exists():
+                    self._cinnabar_installed = True
+
+            # Finally check on the system path.
+            if not self._cinnabar_installed:
+                self._cinnabar_installed = which("git-cinnabar") is not None
 
         return self._cinnabar_installed
 
@@ -2787,7 +2867,7 @@ class Git(Repository):
             return self.git_out(command)
 
         for remote in remotes:
-            logger.info('Determining the commit range using upstream "%s"' % remote)
+            logger.info('Determining the commit range using upstream "%s"', remote)
 
             try:
                 response = self.git_out(command + [remote])
@@ -2805,9 +2885,7 @@ class Git(Repository):
         elif not remotes:
             remotes = self.git_out(["remote"])
             if len(remotes) > 1:
-                logger.warning(
-                    "!! Found multiple upstreams (%s)." % (", ".join(remotes))
-                )
+                logger.warning("!! Found multiple upstreams (%s).", ", ".join(remotes))
 
         unpublished = self._cherry(cherry, remotes)
         if unpublished is None:
@@ -2835,8 +2913,8 @@ class Git(Repository):
                 return line.split("+ ")[1]
             else:
                 logger.warning(
-                    "!! Diff from commit %s found in upstream - omitting."
-                    % line.split("- ")[1]
+                    "!! Diff from commit %s found in upstream - omitting.",
+                    line.split("- ")[1],
                 )
 
     def set_args(self, args):
@@ -3117,7 +3195,7 @@ class Git(Repository):
         if node:
             with wait_message("Checking out %s.." % short_node(node)):
                 self.checkout(node)
-            logger.info("Checked out %s" % short_node(node))
+            logger.info("Checked out %s", short_node(node))
 
         if name and not self.args.no_branch:
             branches = self.git_out(["branch", "--list", "%s*" % name])
@@ -3129,7 +3207,7 @@ class Git(Repository):
                 branch_name = "%s_%s" % (name, i)
 
             self.git(["checkout", "-q", "-b", branch_name])
-            logger.info("Created branch %s" % branch_name)
+            logger.info("Created branch %s", branch_name)
 
     def apply_patch(self, diff, body, author, author_date):
         # apply the patch as a binary file to ensure the correct line endings
@@ -3193,7 +3271,7 @@ class Git(Repository):
             ["show", "-s", "--format=%s%n%b", commit["node"]], split=False
         )
         if current_body == updated_body:
-            logger.debug("not amending commit %s, unchanged" % commit["name"])
+            logger.debug("not amending commit %s, unchanged", commit["name"])
             return
 
         # Create a new commit with the updated body.
@@ -3315,7 +3393,7 @@ class Git(Repository):
                 lines = b_body.splitlines(True)
                 lines = ["+%s" % l for l in lines]
                 new_len = len(lines)
-                if not lines[-1].endswith("\n"):
+                if lines and not lines[-1].endswith("\n"):
                     lines[-1] = "{}\n".format(lines[-1])
                     lines.append("\\ No newline at end of file\n")
 
@@ -3327,7 +3405,7 @@ class Git(Repository):
                 lines = a_body.splitlines(True)
                 lines = ["-%s" % l for l in lines]
                 old_len = len(lines)
-                if not lines[-1].endswith("\n"):
+                if lines and not lines[-1].endswith("\n"):
                     lines[-1] = "{}\n".format(lines[-1])
                     lines.append("\\ No newline at end of file\n")
 
@@ -3534,7 +3612,7 @@ def augment_commits_from_body(commits):
         bug_ids = parse_bugs(commit["title"])
         if bug_ids:
             if len(bug_ids) > 1:
-                logger.warning("Multiple bug-IDs found, using %s" % bug_ids[0])
+                logger.warning("Multiple bug-IDs found, using %s", bug_ids[0])
             commit["bug-id"] = bug_ids[0]
         else:
             commit["bug-id"] = None
@@ -3652,8 +3730,10 @@ def show_commit_stack(
                     revision = revisions[0]
 
                     # Check if target bug ID is the same as in the Phabricator revision
-                    change_bug_id = revision["fields"]["bugzilla.bug-id"] and (
-                        commit["bug-id"] != revision["fields"]["bugzilla.bug-id"]
+                    change_bug_id = (
+                        "bugzilla.bug-id" in revision["fields"]
+                        and revision["fields"]["bugzilla.bug-id"]
+                        and (commit["bug-id"] != revision["fields"]["bugzilla.bug-id"])
                     )
 
                     # Check if comandeering is required
@@ -3665,18 +3745,19 @@ def show_commit_stack(
         else:
             action = action_template % "New"
 
-        logger.info("%s %s %s" % (action, commit["name"], commit["title-preview"]))
+        logger.info("%s %s %s", action, commit["name"], commit["title-preview"])
         if validate:
             if change_bug_id:
                 logger.warning(
-                    "!! Bug ID in Phabricator revision will be changed from %s to %s"
-                    % (revision["fields"]["bugzilla.bug-id"], commit["bug-id"])
+                    "!! Bug ID in Phabricator revision will be changed from %s to %s",
+                    revision["fields"]["bugzilla.bug-id"],
+                    commit["bug-id"],
                 )
 
             if not is_author:
                 logger.warning(
-                    "!! You don't own this revision.  Normally, you should only\n"
-                    '   update revisions you   own.  You can "Commandeer" this\n'
+                    "!! You don't own this revision. Normally, you should only\n"
+                    '   update revisions you own. You can "Commandeer" this\n'
                     "   revision from the web interface if you want to become\n"
                     "   the owner."
                 )
@@ -3686,8 +3767,9 @@ def show_commit_stack(
 
             if commit["bug-id-orig"] and commit["bug-id"] != commit["bug-id-orig"]:
                 logger.warning(
-                    "!! Bug ID changed from %s to %s"
-                    % (commit["bug-id-orig"], commit["bug-id"])
+                    "!! Bug ID changed from %s to %s",
+                    commit["bug-id-orig"],
+                    commit["bug-id"],
                 )
 
             if (
@@ -3697,7 +3779,7 @@ def show_commit_stack(
                 logger.warning("!! Missing reviewers")
 
         if show_rev_urls and commit["rev-id"]:
-            logger.warning("-> %s/D%s" % (conduit.repo.phab_url, commit["rev-id"]))
+            logger.warning("-> %s/D%s", conduit.repo.phab_url, commit["rev-id"])
 
 
 def check_for_invalid_reviewers(reviewers):
@@ -3830,7 +3912,7 @@ def arc_call_conduit(api_method, api_call_args, cwd):
             )
 
     # We expect arc output to be a JSON. However, in DEBUG mode, a `--trace` is used and
-    # the reponse becomes a multiline string with some messages in plain text.
+    # the response becomes a multiline string with some messages in plain text.
     output = "\n".join([line for line in output.splitlines() if line.startswith("{")])
     maybe_error = parse_api_error(output)
     if maybe_error:
@@ -3901,7 +3983,8 @@ def install_certificate(repo, args):
     The response is saved in the ~/.arcrc file."""
     logger.info(
         "LOGIN TO PHABRICATOR\nOpen this page in your browser and login "
-        "to Phabricator if necessary:\n\n%s/conduit/login/\n" % conduit.repo.phab_url
+        "to Phabricator if necessary:\n\n%s/conduit/login/\n",
+        conduit.repo.phab_url,
     )
     token = prompt("Paste API Token from that page: ")
     conduit.save_api_token(token)
@@ -3941,7 +4024,7 @@ def remove_duplicates(reviewers):
 
     Returns: list of unique reviewers.
 
-    Duplicates with excalamation mark are prefered.
+    Duplicates with excalamation mark are preferred.
     """
     unique = []
     nicks = []
@@ -4058,7 +4141,7 @@ def update_revision_description(transactions, commit, revision):
 def update_revision_bug_id(transactions, commit, revision):
     # Appends differential.revision.edit transaction(s) to `transactions` if
     # updating the commit bug-id is required.
-    if commit["bug-id"] != revision["fields"]["bugzilla.bug-id"]:
+    if commit["bug-id"] and commit["bug-id"] != revision["fields"]["bugzilla.bug-id"]:
         transactions.append(dict(type="bugzilla.bug-id", value=commit["bug-id"]))
 
 
@@ -4118,12 +4201,10 @@ def submit(repo, args):
     if not commits:
         raise Error("Failed to find any commits to submit")
     logger.warning(
-        "Submitting %s commit%s %s:"
-        % (
-            len(commits),
-            "" if len(commits) == 1 else "s",
-            "as Work In Progress" if args.wip else "for review",
-        )
+        "Submitting %s commit%s %s:",
+        len(commits),
+        "" if len(commits) == 1 else "s",
+        "as Work In Progress" if args.wip else "for review",
     )
 
     with wait_message("Loading commits.."):
@@ -4142,19 +4223,20 @@ def submit(repo, args):
     except Error as e:
         if not args.force:
             raise Error("Unable to submit commits:\n\n%s" % e)
-        logger.error("Ignoring issues found with commits:\n\n%s" % e)
+        logger.error("Ignoring issues found with commits:\n\n%s", e)
 
     # Show a warning if there are untracked files.
     if config.warn_untracked:
         untracked = repo.untracked()
         if untracked:
             logger.warning(
-                "Warning: found %s untracked file%s (will not be submitted):"
-                % (len(untracked), "" if len(untracked) == 1 else "s")
+                "Warning: found %s untracked file%s (will not be submitted):",
+                len(untracked),
+                "" if len(untracked) == 1 else "s",
             )
             if len(untracked) <= 5:
                 for filename in untracked:
-                    logger.info("  %s" % filename)
+                    logger.info("  %s", filename)
 
     # Show a warning if -m is used and there are new commits.
     if args.message and any([c for c in commits if not c["rev-id"]]):
@@ -4168,7 +4250,7 @@ def submit(repo, args):
         pass
     elif config.auto_submit and not args.interactive:
         logger.info(
-            "Automatically submitting (as per submit.auto_submit in %s)" % config.name
+            "Automatically submitting (as per submit.auto_submit in %s)", config.name
         )
     else:
         res = prompt(
@@ -4209,11 +4291,11 @@ def submit(repo, args):
 
         # Let the user know something's happening.
         if is_update:
-            logger.info("\nUpdating revision D%s:" % commit["rev-id"])
+            logger.info("\nUpdating revision D%s:", commit["rev-id"])
         else:
             logger.info("\nCreating new revision:")
 
-        logger.info("%s %s" % (commit["name"], commit["title-preview"]))
+        logger.info("%s %s", commit["name"], commit["title-preview"])
         repo.checkout(commit["node"])
 
         # WIP submissions shouldn't set reviewers on phabricator.
@@ -4371,15 +4453,15 @@ def update_arc():
     """Write the last check and update arc."""
 
     def update_repo(name, path):
-        logger.info("Updating %s..." % name)
+        logger.info("Updating %s...", name)
         rev = check_output(GIT_COMMAND + ["rev-parse", "HEAD"], split=False, cwd=path)
         check_call(GIT_COMMAND + ["pull", "--quiet"], cwd=path)
         if rev != check_output(
             GIT_COMMAND + ["rev-parse", "HEAD"], split=False, cwd=path
         ):
-            logger.info("%s updated" % name)
+            logger.info("%s updated", name)
         else:
-            logger.info("Update of %s not required" % name)
+            logger.info("Update of %s not required", name)
 
     if not which_path(GIT_COMMAND[0]):
         raise Error(
@@ -4406,6 +4488,11 @@ def get_installed_distribution():
     return get_distribution("MozPhab")
 
 
+def get_name_and_version():
+    dist = get_installed_distribution()
+    return "{} ({})".format(dist.project_name, dist.version)
+
+
 def get_pypi_version():
     url = "https://pypi.org/pypi/MozPhab/json"
     output = urllib.request.urlopen(urllib.request.Request(url), timeout=30).read()
@@ -4414,8 +4501,7 @@ def get_pypi_version():
 
 
 def log_current_version(_):
-    dist = get_installed_distribution()
-    logger.info("{} ({})".format(dist.project_name, dist.version))
+    logger.info(get_name_and_version())
 
 
 def check_for_updates(with_arc=True):
@@ -4447,13 +4533,13 @@ def check_for_updates(with_arc=True):
             return
 
         if config.self_auto_update:
-            logger.info("Upgrading to version {}".format(pypi_version))
+            logger.info("Upgrading to version %s", pypi_version)
             self_upgrade()
             logger.info("Restarting...")
             check_call([sys.executable] + sys.argv)
             sys.exit()
 
-        logger.warning("Version {} of `moz-phab` is now available".format(pypi_version))
+        logger.warning("Version %s of `moz-phab` is now available", pypi_version)
 
 
 def self_upgrade():
@@ -4470,14 +4556,19 @@ def self_upgrade():
     )
 
     # If moz-phab was installed with --user, we need to pass it to pip
-    try:
-        self_file = Path(__file__).resolve()
-        user_file = Path(site.getuserbase()).resolve() / "bin" / self_file.name
-        if self_file == user_file:
-            command.append("--user")
-    except AttributeError:
-        # virtualenvs don't have site.getuserbase()
-        pass
+    # Create "install" distutils command with --user to find the scripts_path
+    d = Distribution()
+    d.parse_config_files()
+    i = d.get_command_obj("install", create=True)
+    # Forcing the environment detected by Distribution to the --user one
+    i.user = True
+    i.prefix = i.exec_prefix = i.home = i.install_base = i.install_platbase = None
+    i.finalize_options()
+    # Checking if the moz-phab script is installed in user's scripts directory
+    script_dir = Path(script_module.__file__).resolve().parent
+    user_dir = Path(i.install_scripts).resolve()
+    if script_dir == user_dir:
+        command.append("--user")
 
     check_call(command)
 
@@ -4537,7 +4628,7 @@ def patch(repo, args):
     args.raw is True - only print out the diffs (--force doesn't change anything)
 
     Raises:
-    * Error if uncommited changes are present in the working tree
+    * Error if uncommitted changes are present in the working tree
     * Error if Phabricator revision is not found
     * Error if `--apply-to base` and no base commit found in the first diff
     * Error if base commit not found in repository
@@ -4553,13 +4644,13 @@ def patch(repo, args):
         with wait_message("Checking VCS"):
             repo.check_vcs()
 
-        # Look for any uncommited changes
+        # Look for any uncommitted changes
         with wait_message("Checking repository.."):
             clean = repo.is_worktree_clean()
 
         if not clean:
             raise Error(
-                "Uncommited changes present. Please %s them or commit before patching."
+                "Uncommitted changes present. Please %s them or commit before patching."
                 % ("shelve" if isinstance(repo, Mercurial) else "stash")
             )
 
@@ -4607,7 +4698,8 @@ def patch(repo, args):
                 if non_linear and not args.yes:
                     logger.warning(
                         "Revision D%s has a non-linear successor graph.\n"
-                        "Unable to apply the full stack." % args.revision_id
+                        "Unable to apply the full stack.",
+                        args.revision_id,
                     )
                     res = prompt("Continue with only part of the stack?", ["Yes", "No"])
                     if res == "No":
@@ -4635,8 +4727,9 @@ def patch(repo, args):
 
     if not args.raw:
         logger.info(
-            "Patching revision%s: %s"
-            % ("s" if len(revs) > 1 else "", " ".join(["D%s" % r["id"] for r in revs]))
+            "Patching revision%s: %s",
+            "s" if len(revs) > 1 else "",
+            " ".join(["D%s" % r["id"] for r in revs]),
         )
 
     # Pull diffs
@@ -4726,10 +4819,10 @@ def patch(repo, args):
                 raise Error("Patch failed to apply")
 
         if not args.raw and rev["id"] != revs[-1]["id"]:
-            logger.info("D%s applied" % rev["id"])
+            logger.info("D%s applied", rev["id"])
 
     if not args.raw:
-        logger.warning("D%s applied" % rev_id)
+        logger.warning("D%s applied", rev_id)
 
 
 def arc_pass(args):
@@ -4740,6 +4833,117 @@ def arc_pass(args):
         check_call(ARC + args.commands)
     except CommandError:
         pass
+
+
+#
+# Reorganise
+#
+
+
+def reorganise(repo, args):
+    with wait_message("Checking connection to Phabricator."):
+        # Check if raw Conduit API can be used
+        if not conduit.check():
+            raise Error("Failed to use Conduit API")
+
+    # Find and preview commits to submits.
+    with wait_message("Looking for commits.."):
+        commits = repo.commit_stack()
+
+    if not commits:
+        raise Error("Failed to find any commits to reorganise.")
+
+    with wait_message("Loading commits.."):
+        augment_commits_from_body(commits)
+
+    localstack_ids = [c["rev-id"] for c in commits]
+    if None in localstack_ids:
+        names = [c["name"] for c in commits if c["rev-id"] is None]
+        plural = len(names) > 1
+        raise Error(
+            "Found new commit{plural} in the local stack: {names}.\n"
+            "Please submit {them} first.".format(
+                plural="s" if plural else "",
+                them="them" if plural else "it",
+                names=", ".join(names),
+            )
+        )
+
+    logger.warning(
+        "Reorganisation based on {} commit{}:".format(
+            len(commits), "" if len(commits) == 1 else "s",
+        )
+    )
+
+    # Get PhabricatorStack
+    # Errors will be raised later in the `walk_llist` method
+    with wait_message("Detecting the remote stack..."):
+        try:
+            phabstack = conduit.get_stack(localstack_ids)
+        except Error as e:
+            logger.error("Remote stack is not linear.")
+            raise
+
+    # Preload the phabricator stack
+    with wait_message("Preloading Phabricator stack revisions..."):
+        conduit.get_revisions(phids=list(phabstack.keys()))
+
+    if phabstack:
+        try:
+            phabstack_phids = walk_llist(phabstack)
+        except Error as e:
+            logger.error(
+                "Remote stack is not linear.\n"
+                "Detected stack:\n{}".format(
+                    " <- ".join(conduit.phids_to_ids(list(phabstack.keys())))
+                )
+            )
+            raise
+    else:
+        phabstack_phids = []
+
+    localstack_phids = conduit.ids_to_phids(localstack_ids)
+    try:
+        transactions = stack_transactions(phabstack_phids, localstack_phids)
+    except Error:
+        logger.error("Unable to prepare stack transactions.")
+        raise
+
+    if not transactions:
+        raise Error("Reorganisation is not needed.")
+
+    logger.warning("Stack will be reorganised:")
+    for phid, rev_transactions in transactions.items():
+        node_id = conduit.phid_to_id(phid)
+        if "abandon" in [t["type"] for t in rev_transactions]:
+            logger.info(" * {} will be abandoned".format(node_id))
+        else:
+            for t in rev_transactions:
+                if t["type"] == "children.set":
+                    logger.info(
+                        " * {child} will depend on {parent}".format(
+                            child=conduit.phid_to_id(t["value"][0]), parent=node_id,
+                        )
+                    )
+                if t["type"] == "children.remove":
+                    logger.info(
+                        " * {child} will no longer depend on {parent}".format(
+                            child=conduit.phid_to_id(t["value"][0]), parent=node_id,
+                        )
+                    )
+
+    if args.yes:
+        pass
+    else:
+        res = prompt("Perform reorganisation", ["Yes", "No"])
+        if res == "No":
+            sys.exit(1)
+
+    with wait_message("Applying transactions..."):
+        for phid, rev_transactions in transactions.items():
+            conduit.edit_revision(rev_id=phid, transactions=transactions[phid])
+
+    logger.info("Stack has been reorganised.")
 
 
 #
@@ -4890,7 +5094,7 @@ def parse_args(argv):
     submit_parser.add_argument(
         "--no-stack",
         action="store_true",
-        help="Submit multiple commits, but do not mark them as dependant",
+        help="Submit multiple commits, but do not mark them as dependent",
     )
     submit_parser.add_argument(
         "--upstream",
@@ -4900,7 +5104,7 @@ def parse_args(argv):
         help='Set upstream branch to detect the starting commit. (default: "")',
     )
     submit_parser.add_argument(
-        "--no-arc", action="store_true", help="EXPERIMENTAL: Submit without Arcanist."
+        "--arc", dest="no_arc", action="store_false", help="Submits with Arcanist.",
     )
     submit_parser.add_argument(
         "--force-vcs",
@@ -4937,6 +5141,10 @@ def parse_args(argv):
     update_parser.add_argument(
         "--force", "-f", action="store_true", help="Force update even if not necessary"
     )
+
+    # We suppress exception stack traces unless --trace is provided
+    update_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
+
     update_parser.set_defaults(func=self_update, needs_repo=False)
 
     # patch
@@ -5004,7 +5212,48 @@ def parse_args(argv):
         action="store_true",
         help="EXPERIMENTAL: Override VCS compatibility check.",
     )
+    # We suppress exception stack traces unless --trace is provided
+    patch_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
     patch_parser.set_defaults(func=patch, needs_repo=True, no_arc=True)
+
+    # reorganise
+
+    reorg_parser = commands.add_parser(
+        "reorg", help="Reorganise commits in Phabricator"
+    )
+    reorg_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Reorganise without confirmation (default: False)",
+    )
+    reorg_parser.add_argument(
+        "--safe-mode",
+        dest="safe_mode",
+        action="store_true",
+        help="Run VCS with only necessary extensions.",
+    )
+    reorg_parser.add_argument(
+        "--upstream",
+        "--remote",
+        "-u",
+        action="append",
+        help='Set upstream branch to detect the starting commit. (default: "")',
+    )
+    reorg_parser.add_argument(
+        "start_rev",
+        nargs="?",
+        default="(auto)",
+        help="Start revision of range to reorganise (default: detected)",
+    )
+    reorg_parser.add_argument(
+        "end_rev",
+        nargs="?",
+        default=".",
+        help="End revision of range to reorganise (default: current commit)",
+    )
+    reorg_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
+    reorg_parser.set_defaults(func=reorganise, needs_repo=True, no_arc=True)
 
     # install-certificate
 
@@ -5017,6 +5266,7 @@ def parse_args(argv):
         action="store_true",
         help="Run VCS with only necessary extensions.",
     )
+    cert_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
     cert_parser.set_defaults(func=install_certificate, needs_repo=True, no_arc=True)
 
     # arc
@@ -5051,6 +5301,8 @@ def main(argv):
         init_logging()
         config = Config()
         os.environ["MOZPHAB"] = "1"
+
+        logger.debug(get_name_and_version())
 
         if config.no_ansi:
             HAS_ANSI = False
@@ -5091,11 +5343,17 @@ def main(argv):
         logger.error(e)
         sys.exit(1)
     except Exception as e:
-        logger.error(
-            traceback.format_exc() if DEBUG else "%s: %s" % (e.__class__.__name__, e)
-        )
+        if DEBUG:
+            logger.error(traceback.format_exc())
+        else:
+            logger.error("%s: %s", e.__class__.__name__, e)
+            logger.error("Run moz-phab again with '--trace' to show the stack trace")
         sys.exit(1)
 
 
-if __name__ == "__main__":
+def run():
     main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    run()

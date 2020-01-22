@@ -9,10 +9,8 @@ import uuid
 
 from callee import Contains
 
+from mozphab import exceptions, mozphab
 
-mozphab = imp.load_source(
-    "mozphab", os.path.join(os.path.dirname(__file__), os.path.pardir, "moz-phab")
-)
 mozphab.SHOW_SPINNER = False
 
 
@@ -40,13 +38,13 @@ class Commits(unittest.TestCase):
     def _assertNoError(self, callableObj, *args, **kwargs):
         try:
             callableObj(*args, **kwargs)
-        except mozphab.Error as e:
+        except exceptions.Error as e:
             self.fail("%s raised" % e)
 
     def _assertError(self, callableObj, expected, *args, **kwargs):
         try:
             callableObj(*args, **kwargs)
-        except mozphab.Error as e:
+        except exceptions.Error as e:
             if expected != str(e).strip():
                 self.fail("%s not raised" % expected)
             return
@@ -54,9 +52,9 @@ class Commits(unittest.TestCase):
             self.fail("%s raised" % e)
         self.fail("%s failed to raise Error" % callableObj)
 
-    @mock.patch("mozphab.check_for_invalid_reviewers")
-    @mock.patch("mozphab.ConduitAPI.get_revisions")
-    @mock.patch("mozphab.ConduitAPI.whoami")
+    @mock.patch("mozphab.mozphab.check_for_invalid_reviewers")
+    @mock.patch("mozphab.mozphab.ConduitAPI.get_revisions")
+    @mock.patch("mozphab.mozphab.ConduitAPI.whoami")
     def test_commit_validation(self, m_whoami, m_get_revs, check_reviewers):
         check_reviewers.return_value = []
         repo = mozphab.Repository("", "", "dummy")
@@ -101,7 +99,7 @@ class Commits(unittest.TestCase):
         m_whoami.return_value = dict(phid="PHID-2")
         self._assertNoError(check, [commit(bug_id=1, rev_id=1)])
 
-    @mock.patch("mozphab.check_for_invalid_reviewers")
+    @mock.patch("mozphab.mozphab.check_for_invalid_reviewers")
     def test_invalid_reviewers_fails_the_stack_validation_check(self, check_reviewers):
         class Args:
             def __init__(self):
@@ -159,6 +157,69 @@ class Commits(unittest.TestCase):
             ),
         )
 
+    @mock.patch("mozphab.mozphab.conduit.get_revisions")
+    @mock.patch("mozphab.mozphab.check_for_invalid_reviewers")
+    def test_validate_duplicate_revision(self, check_reviewers, get_revisions):
+        check_reviewers.return_value = []
+        get_revisions.return_value = [True]
+
+        repo = mozphab.Repository("", "", "dummy")
+
+        self._assertNoError(
+            repo.check_commits_for_submit,
+            (
+                [
+                    commit("1", (["r"], []), name="a"),
+                    commit("2", (["r"], []), name="b"),
+                    commit("3", (["r"], []), name="c"),
+                ]
+            ),
+        )
+
+        self._assertNoError(
+            repo.check_commits_for_submit,
+            (
+                [
+                    commit("1", (["r"], []), rev_id="1", name="a"),
+                    commit("2", (["r"], []), rev_id="2", name="b"),
+                    commit("3", (["r"], []), rev_id="3", name="c"),
+                ]
+            ),
+        )
+
+        self._assertError(
+            repo.check_commits_for_submit,
+            "Phabricator revisions should be unique, but the following commits refer to the same one (D1):\n"
+            "* a\n"
+            "* c",
+            (
+                [
+                    commit("1", (["r"], []), rev_id="1", name="a"),
+                    commit("2", (["r"], []), rev_id="2", name="b"),
+                    commit("3", (["r"], []), rev_id="1", name="c"),
+                ]
+            ),
+        )
+
+        self._assertError(
+            repo.check_commits_for_submit,
+            "Phabricator revisions should be unique, but the following commits refer to the same one (D1):\n"
+            "* a\n"
+            "* c"
+            "\n\n\n"
+            "Phabricator revisions should be unique, but the following commits refer to the same one (D2):\n"
+            "* b\n"
+            "* d",
+            (
+                [
+                    commit("1", (["r"], []), rev_id="1", name="a"),
+                    commit("2", (["r"], []), rev_id="2", name="b"),
+                    commit("3", (["r"], []), rev_id="1", name="c"),
+                    commit("4", (["r"], []), rev_id="2", name="d"),
+                ]
+            ),
+        )
+
     def test_commit_preview(self):
         build = mozphab.build_commit_title
 
@@ -189,7 +250,7 @@ class Commits(unittest.TestCase):
             build(commit("1", None, title="Bug 1 - helper_bug2.html")),
         )
 
-    @mock.patch("mozphab.build_commit_title")
+    @mock.patch("mozphab.mozphab.build_commit_title")
     def test_update_commit_title_previews(self, m_build_commit_title):
         m_build_commit_title.side_effect = lambda x: x["title"] + " preview"
         commits = [dict(title="a"), dict(title="b")]
@@ -427,9 +488,9 @@ class Commits(unittest.TestCase):
         # r?one,two
         self.assertEqual("r?one", replace("r?one,two", reviewers_dict([["one"], []])))
 
-    @mock.patch("mozphab.ConduitAPI.get_revisions")
-    @mock.patch("mozphab.ConduitAPI.whoami")
-    @mock.patch("mozphab.logger")
+    @mock.patch("mozphab.mozphab.ConduitAPI.get_revisions")
+    @mock.patch("mozphab.mozphab.ConduitAPI.whoami")
+    @mock.patch("mozphab.mozphab.logger")
     def test_show_commit_stack(self, mock_logger, m_whoami, m_get_revisions):
         class Repository:
             phab_url = "http://phab"
@@ -454,7 +515,7 @@ class Commits(unittest.TestCase):
         mozphab.show_commit_stack(
             [{"name": "aaa000", "title-preview": "A"}], validate=False
         )
-        mock_logger.info.assert_called_with("(New) aaa000 A")
+        mock_logger.info.assert_called_with("%s %s %s", "(New)", "aaa000", "A")
         self.assertFalse(
             mock_logger.warning.called, "logger.warning() shouldn't be called"
         )
@@ -464,7 +525,7 @@ class Commits(unittest.TestCase):
             [{"name": "aaa000", "title-preview": "A", "rev-id": "12", "bug-id": "1"}],
             validate=False,
         )
-        mock_logger.info.assert_called_with("(D12) aaa000 A")
+        mock_logger.info.assert_called_with("%s %s %s", "(D12)", "aaa000", "A")
         self.assertFalse(
             mock_logger.warning.called, "logger.warning() shouldn't be called"
         )
@@ -479,7 +540,10 @@ class Commits(unittest.TestCase):
         )
         self.assertEqual(2, mock_logger.info.call_count)
         self.assertEqual(
-            [mock.call("(New) bbb000 B"), mock.call("(New) aaa000 A")],
+            [
+                mock.call("%s %s %s", "(New)", "bbb000", "B"),
+                mock.call("%s %s %s", "(New)", "aaa000", "A"),
+            ],
             mock_logger.info.call_args_list,
         )
         mock_logger.reset_mock()
@@ -496,8 +560,8 @@ class Commits(unittest.TestCase):
             ],
             validate=True,
         )
-        mock_logger.info.assert_called_with("(New) aaa000 A")
-        mock_logger.warning.assert_called_with("!! Bug ID changed from 2 to 1")
+        mock_logger.info.assert_called_with("%s %s %s", "(New)", "aaa000", "A")
+        mock_logger.warning.assert_called_with("!! Bug ID changed from %s to %s", 2, 1)
         mock_logger.reset_mock()
 
         mozphab.show_commit_stack(
@@ -520,7 +584,7 @@ class Commits(unittest.TestCase):
             validate=False,
             show_rev_urls=True,
         )
-        mock_logger.warning.assert_called_with("-> http://phab/D123")
+        mock_logger.warning.assert_called_with("-> %s/D%s", "http://phab", "123")
 
         m_get_revisions.reset_mock()
         m_get_revisions.return_value = [
@@ -558,7 +622,7 @@ class Commits(unittest.TestCase):
             validate=True,
         )
         assert mock_logger.warning.call_args_list[1] == mock.call(
-            "!! Bug ID in Phabricator revision will be changed from 1 to 2"
+            "!! Bug ID in Phabricator revision will be changed from %s to %s", "1", "2"
         )
         assert m_get_revisions.call_count == 3
         mock_logger.reset_mock()
@@ -579,7 +643,7 @@ class Commits(unittest.TestCase):
         )
         mock_logger.warning.assert_called_once_with(Contains("Commandeer"))
 
-    @mock.patch("mozphab.update_commit_title_previews")
+    @mock.patch("mozphab.mozphab.update_commit_title_previews")
     def test_update_commits_from_args(self, m_update_title):
         def lwr(revs):
             return [r.lower() for r in revs]
@@ -601,7 +665,7 @@ class Commits(unittest.TestCase):
         # No change if noreviewer  args provided
         commits = copy.deepcopy(_commits)
         commits[1]["reviewers"]["granted"].append("two")
-        with mock.patch("mozphab.config") as m_config:
+        with mock.patch("mozphab.mozphab.config") as m_config:
             m_config.always_blocking = False
             update(commits, Args())
             self.assertEqual(
@@ -677,7 +741,7 @@ class Commits(unittest.TestCase):
         # Forcing blocking reviewers
         commits = copy.deepcopy(_commits)
         commits[1]["reviewers"]["granted"].append("two")
-        with mock.patch("mozphab.config") as m_config:
+        with mock.patch("mozphab.mozphab.config") as m_config:
             m_config.always_blocking = True
             update(commits, Args())
             self.assertEqual(
@@ -730,7 +794,7 @@ class TestUpdateCommitSummary(unittest.TestCase):
 
         self.assertListEqual(t, expected)
 
-    @mock.patch("mozphab.ConduitAPI.get_users")
+    @mock.patch("mozphab.mozphab.ConduitAPI.get_users")
     def test_update_revision_reviewers(self, m_get_users):
         # From https://phabricator.services.mozilla.com/api/differential.revision.edit
         #
@@ -801,6 +865,15 @@ class TestUpdateCommitSummary(unittest.TestCase):
             'ERR-CONDUIT-CORE: Parameter "transactions" is not a list of transactions.',
             mozphab.parse_api_error(api_response),
         )
+
+    def test_update_revision_no_bug_id(self):
+        # Phabricator stores patches with no bug as having an empty string as the bug ID.
+        # We should not explicitly update the bug-id if our bug id is "None".
+        transactions = []
+        mozphab.update_revision_bug_id(
+            transactions, {"bug-id": None}, {"fields": {"bugzilla.bug-id": ""}}
+        )
+        self.assertEqual([], transactions)
 
 
 if __name__ == "__main__":
