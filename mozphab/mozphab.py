@@ -53,9 +53,8 @@ from .exceptions import (
     NonLinearException,
     NotFoundError,
 )
-
 from .reorganise import stack_transactions, walk_llist
-
+from .sentry import init_sentry, report_to_sentry
 
 # Known Issues
 # - commits with a description already modified by arc (ie. the follow the arc commit
@@ -572,6 +571,9 @@ class Config(object):
             self_last_check = 0
             arc_last_check = 0
             self_auto_update = True
+            
+            [error_reporting]
+            report_to_sentry = True
             """
 
         self._config = configparser.ConfigParser()
@@ -598,6 +600,9 @@ class Config(object):
         self.arc_last_check = self._config.getint("updater", "arc_last_check")
         git_remote = self._config.get("git", "remote")
         self.git_remote = git_remote.replace(" ", "").split(",") if git_remote else []
+        self.report_to_sentry = self._config.getboolean(
+            "error_reporting", "report_to_sentry"
+        )
 
         if should_access_file and not os.path.exists(self._filename):
             self.write()
@@ -2207,17 +2212,17 @@ class Mercurial(Repository):
                 logger.info("Bookmark set to %s", bookmark_name)
 
     def apply_patch(self, diff, body, author, author_date):
-        commands = []
+        changeset = ["# HG changeset patch"]
         if author:
-            commands.extend(["-u", author])
+            changeset.append("# User {}".format(author))
 
         if author_date:
-            commands.extend(["-d", author_date])
+            changeset.append("# Date {} 0".format(author_date))
 
-        with temporary_binary_file(diff.encode("utf8")) as patch_file, temporary_file(
-            body
-        ) as body_file:
-            self.hg(["import", patch_file, "--quiet", "-l", body_file] + commands)
+        changeset.extend([body, diff])
+        changeset_str = "\n".join(changeset)
+        with temporary_binary_file(changeset_str.encode("utf8")) as changeset_file:
+            self.hg(["import", changeset_file, "--quiet"])
 
     def _amend_commit_body(self, node, body):
         with temporary_file(body) as body_file:
@@ -2406,10 +2411,11 @@ class Mercurial(Repository):
     def _get_file_modes(self, commit):
         """Get modes of the modified files."""
         old_modes = self.hg_out(
-            ["manifest", "-T", "{mode} {path}\n", "-r", commit["parent"]]
+            ["manifest", "-T", "{mode} {path}\n", "-r", commit["parent"]],
+            never_log=True,
         )
         new_modes = self.hg_out(
-            ["manifest", "-T", "{mode} {path}\n", "-r", commit["node"]]
+            ["manifest", "-T", "{mode} {path}\n", "-r", commit["node"]], never_log=True
         )
         file_modes = {}
         for s_info in old_modes:
@@ -2558,6 +2564,11 @@ class Mercurial(Repository):
         else:
             lines = meta["body"].splitlines(keepends=True)
             lines = ["+%s" % l for l in lines]
+
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] = "{}\n".format(lines[-1])
+                lines.append("\\ No newline at end of file\n")
+
             self._change_create_hunk(
                 change, fn, lines, meta["file_size"], parent, node, 0, 1, 0, len(lines)
             )
@@ -2568,8 +2579,13 @@ class Mercurial(Repository):
         if meta["binary"]:
             self._change_set_binary(change, meta["bin_body"], "", meta["mime"], "")
         else:
-            lines = meta["body"].splitlines(True)
+            lines = meta["body"].splitlines(keepends=True)
             lines = ["-%s" % l for l in lines]
+
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] = "{}\n".format(lines[-1])
+                lines.append("\\ No newline at end of file\n")
+
             self._change_create_hunk(
                 change, fn, lines, meta["file_size"], parent, node, 1, 0, len(lines), 0
             )
@@ -3160,7 +3176,7 @@ class Git(Repository):
             commands.append('--author="%s"' % author)
 
         if author_date:
-            commands.append('--date="%s"' % author_date)
+            commands.append('--date="format:raw:%s 0"' % author_date)
 
         with temporary_file(body) as temp_f:
             commands += ["-F", temp_f]
@@ -3214,6 +3230,7 @@ class Git(Repository):
         # is used.
         with temporary_binary_file(diff.encode("utf8")) as patch_file:
             self.git(["apply", "--index", patch_file])
+
         self.commit(body, author, author_date)
 
     def _get_current_head(self):
@@ -3949,12 +3966,14 @@ def install_arc_if_required():
     if os.path.exists(ARC_COMMAND) and os.path.exists(LIBPHUTIL_PATH):
         return
 
+    check_git("Git is required to install Arcanist.")
+
     logger.info("Installing arc")
     logger.debug("arc command: %s", ARC_COMMAND)
     logger.debug("libphutil path: %s", LIBPHUTIL_PATH)
 
-    check_call(["git", "clone", "--depth", "1", ARC_URL, ARC_PATH])
-    check_call(["git", "clone", "--depth", "1", LIBPHUTIL_URL, LIBPHUTIL_PATH])
+    check_call(GIT_COMMAND + ["clone", "--depth", "1", ARC_URL, ARC_PATH])
+    check_call(GIT_COMMAND + ["clone", "--depth", "1", LIBPHUTIL_URL, LIBPHUTIL_PATH])
 
 
 def arc_ping(cwd):
@@ -4449,6 +4468,11 @@ def submit(repo, args):
 #
 
 
+def check_git(message=""):
+    if not which_path(GIT_COMMAND[0]):
+        raise Error("Failed to find 'git' executable. {}".format(message))
+
+
 def update_arc():
     """Write the last check and update arc."""
 
@@ -4463,11 +4487,11 @@ def update_arc():
         else:
             logger.info("Update of %s not required", name)
 
-    if not which_path(GIT_COMMAND[0]):
-        raise Error(
-            "Failed to find 'git' executable, which is required to install "
-            "MozPhab's dependencies."
-        )
+    if not os.path.exists(ARC_COMMAND) or not os.path.exists(LIBPHUTIL_PATH):
+        # Nothing to update
+        return
+
+    check_git("Git is required to install Arcanist.")
 
     try:
         update_repo("libphutil", LIBPHUTIL_PATH)
@@ -4570,7 +4594,30 @@ def self_upgrade():
     if script_dir == user_dir:
         command.append("--user")
 
-    check_call(command)
+    if IS_WINDOWS:
+        # Windows does not allow to remove the exe file of the running process.
+        # Renaming the `moz-phab.exe` file to allow pip to install a new version.
+        temp_exe = Path(tempfile.gettempdir()) / "moz-phab.exe"
+        try:
+            temp_exe.unlink()
+        except FileNotFoundError:
+            pass
+
+        exe = script_dir / "moz-phab.exe"
+        exe.rename(temp_exe)
+
+        try:
+            check_call(command)
+        except:
+            temp_exe.rename(exe)
+            raise
+
+        if not exe.is_file():
+            # moz-phab.exe is not created - install wasn't needed.
+            temp_exe.rename(exe)
+
+    else:
+        check_call(command)
 
 
 def self_update(_):
@@ -4791,11 +4838,9 @@ def patch(repo, args):
             raw = conduit.call("differential.getrawdiff", {"diffID": diff["id"]})
 
         if args.no_commit:
-            if repo.vcs == "hg" and not which_path(GIT_COMMAND[0]):
-                raise Error(
-                    "Failed to find 'git' executable.\n"
-                    "Git is required to apply patches."
-                )
+            if repo.vcs == "hg":
+                check_git("Git is required to apply patches.")
+
             with wait_message("Applying D%s.." % rev["id"]):
                 apply_patch(raw, repo.path)
 
@@ -4808,13 +4853,10 @@ def patch(repo, args):
                 diff_commits[0]["author"]["name"],
                 diff_commits[0]["author"]["email"],
             )
-            author_date = datetime.datetime.fromtimestamp(
-                diff["fields"]["dateCreated"]
-            ).isoformat()
 
             try:
                 with wait_message("Applying D%s.." % rev["id"]):
-                    repo.apply_patch(raw, body, author, author_date)
+                    repo.apply_patch(raw, body, author, diff["fields"]["dateCreated"])
             except subprocess.CalledProcessError:
                 raise Error("Patch failed to apply")
 
@@ -5010,7 +5052,12 @@ def parse_args(argv):
     # submit
 
     submit_parser = commands.add_parser(
-        "submit", help="Submit commits(s) to Phabricator"
+        "submit",
+        help="Submit commit(s) to Phabricator.",
+        description=(
+            "MozPhab will change the working directory and amend the commits during "
+            "the submission process."
+        ),
     )
     submit_parser.add_argument(
         "--path", "-p", help="Set path to repository (default: detected)"
@@ -5138,14 +5185,10 @@ def parse_args(argv):
     # self-update
 
     update_parser = commands.add_parser("self-update", help="Update review script")
-    update_parser.add_argument(
-        "--force", "-f", action="store_true", help="Force update even if not necessary"
-    )
-
     # We suppress exception stack traces unless --trace is provided
     update_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
 
-    update_parser.set_defaults(func=self_update, needs_repo=False)
+    update_parser.set_defaults(func=self_update, needs_repo=False, no_arc=True)
 
     # patch
 
@@ -5292,15 +5335,19 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def main(argv):
+def main(argv, *, is_development):
     global config, HAS_ANSI, DEBUG, SHOW_SPINNER
     try:
-        if not os.path.exists(MOZBUILD_PATH):
-            os.makedirs(MOZBUILD_PATH)
+        config = Config()
+
+        if not is_development and config.report_to_sentry:
+            init_sentry()
 
         init_logging()
-        config = Config()
         os.environ["MOZPHAB"] = "1"
+
+        if not os.path.exists(MOZBUILD_PATH):
+            os.makedirs(MOZBUILD_PATH)
 
         logger.debug(get_name_and_version())
 
@@ -5348,11 +5395,16 @@ def main(argv):
         else:
             logger.error("%s: %s", e.__class__.__name__, e)
             logger.error("Run moz-phab again with '--trace' to show the stack trace")
+        report_to_sentry(e)
         sys.exit(1)
 
 
 def run():
-    main(sys.argv[1:])
+    main(sys.argv[1:], is_development=False)
+
+
+def run_dev():
+    main(sys.argv[1:], is_development=True)
 
 
 if __name__ == "__main__":

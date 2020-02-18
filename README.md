@@ -47,6 +47,9 @@ always_full_stack = False
 self_last_check = 0
 arc_last_check = 0
 self_auto_update = True
+
+[error_reporting]
+report_to_sentry = True
 ```
 
 - `ui.no_ansi` : never use ANSI colours (default: auto-detected).
@@ -77,6 +80,8 @@ self_auto_update = True
     an update was performed for arc.  set to `-1` to disable this check.
 - `self_auto_update` : when `True` moz-phab will auto-update if a new version is available.
     If `False` moz-phab will only warn about the new version.
+- `error_reporting.report_to_sentry` : when `True` moz-phab will submit exceptions to 
+    Sentry so moz-phab devs can see unreported errors.
 
 `moz-phab` can also be configured via the following environmental variables:
 - `DEBUG` : enabled debugging output (default: disabled)
@@ -92,7 +97,7 @@ To get information about all available commands run
 All commands involving VCS (like `submit` and `patch`) might be used with a
 `--safe-mode` switch. It will run the VCS command with only chosen set of extensions.
 
-### Submitting commits to the Phabricator
+### Submitting commits to Phabricator
 The simplest invocation is
 
 ```
@@ -133,11 +138,11 @@ abandoned manually.  See
 planned fixes.  Also note that "fix-up" commits are not yet supported;
 see [bug 1481542](https://bugzilla.mozilla.org/show_bug.cgi?id=1481542).
 
-MozPhab is not using Arcanist to submit commits to the Phabricator.
+MozPhab is not using Arcanist to submit commits to Phabricator.
 If you wish to do so add the `--arc` switch. File a bug if you needed to use it because
 MozPhab failed to submit with default settings.
 
-### Downloading a patch from the Phabricator
+### Downloading a patch from Phabricator
 
 `moz-phab patch` allows patching an entire stack of revisions. The simplest
 invocation is
@@ -147,7 +152,7 @@ invocation is
 ```
 
 To patch a stack ending with the revision `D123` run `moz-phab patch D123`.
-Diffs will be downloaded from the Phabricator and applied using the underlying
+Diffs will be downloaded from Phabricator and applied using the underlying
 VCS (`import` for Mercurial or `apply` for Git). A commit for each revision will
 be created in a new bookmark (Mercurial) or branch (Git).
 
@@ -187,6 +192,23 @@ you need to change the parent/child relation of the revisions in Phabricator.
 `moz-phab reorg` command will compare the stack, display what will be changed and 
 ask for permission before taking any action.
 
+### Associating a commit to an existing phabricator revision
+
+`moz-phab` tracks which revision is associated with a commit using a line in the
+commit message. If you want to work on an existing revision from a different
+machine or environment, we recommend you [apply the existing revision from
+Phabricator using `moz-phab patch`](#downloading-a-patch-from-phabricator).
+
+If that isn't an option for whatever reason, you can associate a new commit to
+the same revision by adding a line similar to the following to the extended
+commit message:
+
+```
+Differential Revision: https://phabricator.services.mozilla.com/D[revision]
+```
+
+replacing `[revision]` with the identifier of your revision.
+
 ### Running arc commands
 
 * **Note** You will need to have PHP installed to run `arc` commands.*
@@ -209,7 +231,7 @@ File bugs in Bugzilla under
 ## Development
 
 To install your code call `pip3 install -e .` from MozPhab project directory (`review`
-by default). Your code will be executed by calling `moz-phab`.
+by default). Your code will be executed by calling `moz-phab-dev`.
 
 Tests can be executed with `pytest`.
 Integration tests require to have access to `git`, `hg` with `evolve` extension.
@@ -217,10 +239,20 @@ Integration tests require to have access to `git`, `hg` with `evolve` extension.
 All python code must be formatted with [black](https://github.com/ambv/black)
 using the default settings.
 
-Pull Requests are not accepted here; please submit changes with Phabricator.
+### Submitting patches
 
-Consider using [suite](https://github.com/mozilla-conduit/suite) to use MozPhab with 
-Phabricator installed on your local machine.
+Pull Requests are not accepted here; please submit changes to Phabricator using `moz-phab`.
+
+1. Follow the [setup](https://moz-conduit.readthedocs.io/en/latest/phabricator-user.html#setting-up-mozphab)
+2. Once your patch is written and committed locally, run `moz-phab` to send it to Phabricator
+
+### Local environment
+
+By using [suite](https://github.com/mozilla-conduit/suite), you can run a local
+environment with its own instances of Phabricator, BMO, Hg, and other services.
+
+This enables more thorough integration testing of `moz-phab` without affecting
+production data.
 
 You can order the suite to use your local code by calling:
 

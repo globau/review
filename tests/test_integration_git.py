@@ -46,7 +46,9 @@ def test_submit_create_arc(in_process, git_repo_path, init_sha):
     testfile = git_repo_path / "untracked"
     testfile.write_text("a")
 
-    mozphab.main(["submit", "--arc", "--yes", "--bug", "1", init_sha])
+    mozphab.main(
+        ["submit", "--arc", "--yes", "--bug", "1", init_sha], is_development=True
+    )
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
     expected = """
@@ -72,16 +74,14 @@ def test_submit_create(in_process, git_repo_path, init_sha):
         # differential.revision.edit
         dict(object=dict(id="123")),
     )
-    testfile = git_repo_path / "X"
-    testfile.write_text("ą\r\nb\nc")
+    (git_repo_path / "X").write_text("ą\r\nb\nc\n")
+    (git_repo_path / "Y").write_text("no line ending")
     git_out("add", ".")
-    msgfile = git_repo_path / "msg"
-    msgfile.write_text("Ą r?alice")
+    (git_repo_path / "msg").write_text("Ą r?alice")
     git_out("commit", "--file", "msg")
-    testfile = git_repo_path / "untracked"
-    testfile.write_text("a")
+    (git_repo_path / "untracked").write_text("a\n")
 
-    mozphab.main(["submit", "--yes", "--bug", "1", init_sha])
+    mozphab.main(["submit", "--yes", "--bug", "1", init_sha], is_development=True)
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
     expected = """
@@ -129,11 +129,9 @@ Differential Revision: http://example.test/D123
                                 "newLength": 3,
                                 "addLines": 3,
                                 "delLines": 0,
-                                "corpus": (
-                                    "+ą\r\n+b\n+c\n\\ No newline at end of file\n"
-                                ),
+                                "corpus": "+ą\r\n+b\n+c\n",
                                 "isMissingOldNewline": False,
-                                "isMissingNewNewline": True,
+                                "isMissingNewNewline": False,
                             }
                         ],
                         "oldProperties": {},
@@ -141,7 +139,31 @@ Differential Revision: http://example.test/D123
                         "fileType": 1,
                         "type": 1,
                         "metadata": {},
-                    }
+                    },
+                    {
+                        "commitHash": mock.ANY,
+                        "awayPaths": [],
+                        "newProperties": {"unix:filemode": "100644"},
+                        "oldPath": None,
+                        "hunks": [
+                            {
+                                "oldOffset": 0,
+                                "oldLength": 0,
+                                "newOffset": 1,
+                                "newLength": 1,
+                                "addLines": 1,
+                                "delLines": 0,
+                                "corpus": "+no line ending\n\\ No newline at end of file\n",
+                                "isMissingOldNewline": False,
+                                "isMissingNewNewline": True,
+                            }
+                        ],
+                        "oldProperties": {},
+                        "currentPath": "Y",
+                        "fileType": 1,
+                        "type": 1,
+                        "metadata": {},
+                    },
                 ],
                 "creationMethod": "moz-phab-git",
             },
@@ -180,7 +202,7 @@ def test_submit_create_no_bug(in_process, git_repo_path, init_sha):
     msgfile.write_text("A r?alice")
     git_out("commit", "--file", "msg")
 
-    mozphab.main(["submit", "--yes", "--no-bug", init_sha])
+    mozphab.main(["submit", "--yes", "--no-bug", init_sha], is_development=True)
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
     expected = """
@@ -201,7 +223,9 @@ def test_submit_create_binary_arc(in_process, git_repo_path, init_sha, data_file
     git_out("add", ".")
     git_out("commit", "--message", "IMG")
 
-    mozphab.main(["submit", "--arc", "--yes", "--bug", "1", init_sha])
+    mozphab.main(
+        ["submit", "--arc", "--yes", "--bug", "1", init_sha], is_development=True
+    )
     expected = """
 Bug 1 - IMG
 
@@ -230,7 +254,7 @@ def test_submit_create_binary(in_process, git_repo_path, init_sha, data_file):
     git_out("add", ".")
     git_out("commit", "-m", "IMG")
 
-    mozphab.main(["submit", "--yes", "--bug", "1", init_sha])
+    mozphab.main(["submit", "--yes", "--bug", "1", init_sha], is_development=True)
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
     expected = """
@@ -288,7 +312,8 @@ Differential Revision: http://example.test/D123
         ["submit", "--yes"]
         + ["--bug", "1"]
         + ["--message", "update message ćwikła"]
-        + [init_sha]
+        + [init_sha],
+        is_development=True,
     )
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
@@ -325,12 +350,12 @@ def test_submit_remove_cr(in_process, git_repo_path, init_sha):
     test_a.write_text("a\r\nb\n")
     git_out("add", "X")
     git_out("commit", "-am", "A r?alice")
-    mozphab.main(["submit", "--yes", "--bug", "1", init_sha])
+    mozphab.main(["submit", "--yes", "--bug", "1", init_sha], is_development=True)
     call_conduit.reset_mock()
     # removing CR, leaving LF
     test_a.write_text("a\nb\n")
     git_out("commit", "-am", "B r?alice")
-    mozphab.main(["submit", "--yes", "--bug", "1", "HEAD~"])
+    mozphab.main(["submit", "--yes", "--bug", "1", "HEAD~"], is_development=True)
 
     assert (
         mock.call(
@@ -440,7 +465,7 @@ Differential Revision: http://example.test/D123
     )
     git_out("commit", "--file", "msg")
 
-    mozphab.main(["submit", "--yes", "--bug", "1", init_sha])
+    mozphab.main(["submit", "--yes", "--bug", "1", init_sha], is_development=True)
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
     expected = """\
@@ -483,7 +508,9 @@ def test_submit_different_author_arc(in_process, git_repo_path, init_sha):
         "B r?alice",
     )
 
-    mozphab.main(["submit", "--arc", "--yes", "--bug", "1", init_sha])
+    mozphab.main(
+        ["submit", "--arc", "--yes", "--bug", "1", init_sha], is_development=True
+    )
 
     log = git_out("log", "--format=%aD+++%an+++%ae", "-2")
     expected = """\
@@ -513,7 +540,9 @@ def test_submit_utf8_author_arc(in_process, git_repo_path, init_sha):
         "A r?alice",
     )
 
-    mozphab.main(["submit", "--arc", "--yes", "--bug", "1", init_sha])
+    mozphab.main(
+        ["submit", "--arc", "--yes", "--bug", "1", init_sha], is_development=True
+    )
 
     log = git_out("log", "--format=%aD+++%an+++%ae", "-1")
     expected = "Tue, 22 Jan 2019 13:42:48 +0000+++ćwikła+++ćwikła@bar.com\n"
@@ -561,7 +590,8 @@ Differential Revision: http://example.test/D123
         ["submit", "--arc", "--yes"]
         + ["--bug", "1"]
         + ["--message", "update message ćwikła"]
-        + [init_sha]
+        + [init_sha],
+        is_development=True,
     )
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
@@ -613,7 +643,9 @@ Differential Revision: http://example.test/D123
 """,
     )
 
-    mozphab.main(["submit", "--arc", "--yes", "--bug", "2", init_sha])
+    mozphab.main(
+        ["submit", "--arc", "--yes", "--bug", "2", init_sha], is_development=True
+    )
 
     arc_call_conduit.assert_called_once_with(
         "differential.revision.edit",
@@ -679,7 +711,8 @@ Differential Revision: http://example.test/D124
             ["submit", "--yes"]
             + ["--bug", "1"]
             + ["--message", "update message ćwikła"]
-            + [init_sha]
+            + [init_sha],
+            is_development=True,
         )
     assert "query result for revision D124" in str(excinfo.value)
 
@@ -703,7 +736,7 @@ def test_empty_file(in_process, git_repo_path, init_sha):
     git_out("add", ".")
     git_out("commit", "--message", "A")
 
-    mozphab.main(["submit", "--yes", "--bug", "1", init_sha])
+    mozphab.main(["submit", "--yes", "--bug", "1", init_sha], is_development=True)
 
     log = git_out("log", "--format=%s%n%n%b", "-1")
     expected = """
@@ -725,7 +758,7 @@ Differential Revision: http://example.test/D123
     )
     testfile.unlink()
     git_out("commit", "-a", "--message", "B")
-    mozphab.main(["submit", "--yes", "--bug", "1", "HEAD~"])
+    mozphab.main(["submit", "--yes", "--bug", "1", "HEAD~"], is_development=True)
     log = git_out("log", "--format=%s%n%n%b", "-1")
     expected = """
 Bug 1 - B
