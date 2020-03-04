@@ -17,7 +17,6 @@ import datetime
 import io
 import json
 import logging
-import logging.handlers
 import mimetypes
 import operator
 import os
@@ -39,7 +38,6 @@ from collections import namedtuple
 from contextlib import contextmanager, suppress
 from distutils.dist import Distribution
 from distutils.version import LooseVersion
-from glob import glob
 from pathlib import Path
 from pkg_resources import get_distribution, parse_version
 from shlex import quote
@@ -53,6 +51,17 @@ from .exceptions import (
     NonLinearException,
     NotFoundError,
 )
+from .gitcommand import GitCommand
+from .helpers import (
+    parse_config,
+    read_json_field,
+    which_path,
+    temporary_file,
+    temporary_binary_file,
+)
+from .logger import init_logging, logger
+from .simplecache import cache
+from .subprocess_wrapper import check_call, check_call_by_line, check_output
 from .reorganise import stack_transactions, walk_llist
 from .sentry import init_sentry, report_to_sentry
 
@@ -78,7 +87,6 @@ HAS_ANSI = (
         or os.getenv("PYCHARM_HOSTED", "") == "1"
     )
 )
-SELF_FILE = os.getenv("UPDATE_FILE") if os.getenv("UPDATE_FILE") else __file__
 # Switched off temporarily due to https://bugzilla.mozilla.org/show_bug.cgi?id=1565502
 SHOW_SPINNER = False
 
@@ -97,6 +105,7 @@ DEFAULT_START_REV = "(auto)"
 DEFAULT_END_REV = "."
 
 GIT_COMMAND = ["git.exe" if IS_WINDOWS else "git"]
+HG_COMMAND = ["hg.exe" if IS_WINDOWS else "hg"]
 HOME_DIR = os.path.expanduser("~")
 
 # ~/.mozbuild/moz-phab
@@ -104,9 +113,6 @@ MOZBUILD_PATH = os.path.join(
     os.environ.get("MOZBUILD_STATE_PATH", os.path.join(HOME_DIR, ".mozbuild")),
     "moz-phab",
 )
-LOG_FILE = os.path.join(MOZBUILD_PATH, "moz-phab.log")
-LOG_MAX_SIZE = 1024 * 1024 * 50
-LOG_BACKUPS = 5
 
 # Arcanist
 LIBPHUTIL_PATH = os.path.join(MOZBUILD_PATH, "libphutil")
@@ -203,170 +209,6 @@ NULL_SHA1 = "0" * 40
 #
 
 
-class SimpleCache:
-    """Simple key/value store with all lowercase keys."""
-
-    def __init__(self):
-        self._cache = dict()
-
-    def __contains__(self, key):
-        return key.lower() in self._cache
-
-    def get(self, key):
-        return self._cache.get(key.lower())
-
-    def set(self, key, value):
-        self._cache[key.lower()] = value
-
-    def delete(self, key):
-        if key in self:
-            del self._cache[key.lower()]
-
-    def reset(self):
-        self._cache = dict()
-
-
-cache = SimpleCache()
-
-
-def which_path(path):
-    """Check if an executable is provided. Fall back to which if not.
-
-    Args:
-        path: (str) filename or path to check for an executable command
-
-    Returns:
-        The full path of a command or None.
-    """
-    if (
-        os.path.exists(path)
-        and os.access(path, os.F_OK | os.X_OK)
-        and not os.path.isdir(path)
-    ):
-        logger.debug("Path found: %s", path)
-        return path
-
-    return which(path)
-
-
-def parse_zulu_time(timestamp):
-    """Parse YYYY-MM-DDTHH:mm:SSZ date string, return as epoch seconds in local tz."""
-    return calendar.timegm(time.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ"))
-
-
-def check_call(command, **kwargs):
-    # wrapper around subprocess.check_call with debug output
-    logger.debug("$ %s", " ".join(quote(s) for s in command))
-    try:
-        subprocess.check_call(command, **kwargs)
-    except subprocess.CalledProcessError as e:
-        raise CommandError(
-            "command '%s' failed to complete successfully" % command[0], e.returncode
-        )
-
-
-def check_call_by_line(command, cwd=None, never_log=False):
-    # similar to check_call, yields for line-by-line processing
-    logger.debug("$ %s", " ".join(quote(s) for s in command))
-
-    # Connecting the STDIN to the PIPE will make arc throw an exception on reading
-    # user input
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stdin=subprocess.PIPE,
-        cwd=cwd,
-        universal_newlines=True,
-    )
-    try:
-        for line in iter(process.stdout.readline, ""):
-            line = line.rstrip()
-            if not never_log:
-                logger.debug("> %s", line)
-            yield line
-    finally:
-        process.stdout.close()
-        process.wait()
-
-    if process.returncode:
-        raise CommandError(
-            "command '%s' failed to complete successfully" % command[0],
-            process.returncode,
-        )
-
-
-def check_output(
-    command,
-    cwd=None,
-    split=True,
-    keep_ends=False,
-    strip=True,
-    never_log=False,
-    stdin=None,
-    stderr=None,
-    env=None,
-    search_error=None,
-    expect_binary=False,
-):
-    # wrapper around subprocess.check_output with debug output and splitting
-    logger.debug("$ %s", " ".join(quote(s) for s in command))
-    kwargs = dict(cwd=cwd, stdin=stdin, stderr=stderr)
-    if not expect_binary:
-        kwargs["universal_newlines"] = True
-
-    if env:
-        kwargs["env"] = env
-
-    try:
-        output = subprocess.check_output(command, **kwargs)
-    except subprocess.CalledProcessError as e:
-        if search_error:
-            for err in search_error:
-                if err["matching"] in e.output:
-                    logger.error(err["message"])
-
-        if e.output and not never_log:
-            logger.debug(e.output)
-
-        if e.stderr and not never_log:
-            logger.debug(e.stderr)
-
-        raise CommandError(
-            "command '%s' failed to complete successfully" % command[0], e.returncode
-        )
-
-    if expect_binary:
-        logger.debug("%s bytes of data received", len(output))
-        return output
-
-    if strip:
-        output = output.rstrip()
-    if output and not never_log:
-        logger.debug(output)
-    return output.splitlines(keep_ends) if split else output
-
-
-def read_json_field(files, field_path):
-    """Parses json files in turn returning value as per field_path, or None."""
-    for filename in files:
-        try:
-            with open(filename, encoding="utf-8") as f:
-                rc = json.load(f)
-                for field_name in field_path:
-                    if field_name not in rc:
-                        rc = None
-                        break
-                    rc = rc[field_name]
-                if not rc:
-                    continue
-                return rc
-        except FileNotFoundError:
-            continue
-        except ValueError:
-            continue
-    return None
-
-
 def prompt(question, options=None):
     if HAS_ANSI:
         question = "\033[33m%s\033[0m" % question
@@ -395,69 +237,12 @@ def prompt(question, options=None):
             return options_map[res]
 
 
-def parse_config(config_list, filter_func=None):
-    """Parses list with "name=value" strings.
-
-    Args:
-        config_list: A list of "name=value" strings
-        filter_func: A function taking the parsing config name and value for each line.
-            If the function returns True the config value will be included in the final
-            dict.
-
-    Returns: A dict containing parsed data.
-    """
-    result = dict()
-    for line in config_list:
-        # On Windows config file is likely to be cp1252 encoded, not UTF-8.
-        if IS_WINDOWS:
-            try:
-                line = line
-            except UnicodeDecodeError:
-                pass
-
-        try:
-            name, value = line.split("=", 1)
-        except ValueError:
-            continue
-
-        name = name.strip()
-        value = value.strip()
-        if filter_func is None or (callable(filter_func) and filter_func(name, value)):
-            result[name] = value
-
-    return result
-
-
 def normalise_reviewer(reviewer, strip_group=True):
     """This provide a canonical form of the reviewer for comparison."""
     reviewer = reviewer.rstrip("!").lower()
     if strip_group:
         reviewer = reviewer.lstrip("#")
     return reviewer
-
-
-@contextmanager
-def temporary_file(content, encoding="utf-8"):
-    f = tempfile.NamedTemporaryFile(delete=False, mode="w+", encoding=encoding)
-    try:
-        f.write(content)
-        f.flush()
-        f.close()
-        yield f.name
-    finally:
-        os.remove(f.name)
-
-
-@contextmanager
-def temporary_binary_file(content):
-    f = tempfile.NamedTemporaryFile(delete=False, mode="wb+")
-    try:
-        f.write(content)
-        f.flush()
-        f.close()
-        yield f.name
-    finally:
-        os.remove(f.name)
 
 
 def short_node(text):
@@ -559,6 +344,10 @@ class Config(object):
 
             [git]
             remote =
+            command_path =
+
+            [hg]
+            command_path = 
 
             [submit]
             auto_submit = False
@@ -606,6 +395,10 @@ class Config(object):
         self.report_to_sentry = self._config.getboolean(
             "error_reporting", "report_to_sentry"
         )
+        self._git_command = self._config.get("git", "command_path")
+        self.git_command = [self._git_command] if self._git_command else GIT_COMMAND
+        self._hg_command = self._config.get("hg", "command_path")
+        self.hg_command = [self._hg_command] if self._hg_command else HG_COMMAND
 
         if should_access_file and not os.path.exists(self._filename):
             self.write()
@@ -631,6 +424,8 @@ class Config(object):
             self._set("ui", "no_ansi", self.no_ansi)
             self._set("vcs", "safe_mode", self.safe_mode)
             self._set("git", "remote", ", ".join(self.git_remote))
+            self._set("git", "command_path", ", ".join(self._git_command))
+            self._set("hg", "command_path", ", ".join(self.hg_command))
             self._set("submit", "auto_submit", self.auto_submit)
             self._set("submit", "always_blocking", self.always_blocking)
             self._set("submit", "warn_untracked", self.warn_untracked)
@@ -834,7 +629,7 @@ class ConduitAPI:
 
         else:
             phids_by_id = {}
-            found_phids = phids[:]
+            found_phids = phids.copy()
             query_field = "phids"
             query_values = set([phid for phid in phids if "rev-%s" % phid not in cache])
 
@@ -1808,6 +1603,7 @@ class Repository(object):
             return True
 
         if self.vcs != self.phab_vcs:
+            # This error is captured in Git and not raised if Cinnabar installed.
             raise Error(
                 "Local VCS ({local}) is different from the one defined in the "
                 "repository ({remote}).".format(local=self.vcs, remote=self.phab_vcs)
@@ -1855,7 +1651,7 @@ class Mercurial(Repository):
         super().__init__(path, dot_path)
         self.vcs = "hg"
 
-        self._hg = ["hg.exe" if IS_WINDOWS else "hg"]
+        self._hg = config.hg_command.copy()
         self.revset = None
         self.strip_nodes = []
         self.status = None
@@ -1873,7 +1669,7 @@ class Mercurial(Repository):
 
         # Check for `hg`, and mercurial version.
         if not which_path(self._hg[0]):
-            raise Error("Failed to find 'hg' executable")
+            raise Error("Failed to find hg executable ({})".format(self._hg[0]))
         m = re.search(
             r"\(version ([^)]+)\)", self.hg_out(["--version", "--quiet"], split=False)
         )
@@ -2742,12 +2538,7 @@ class Git(Repository):
 
         logger.debug("found git repo in %s", path)
 
-        self._git = GIT_COMMAND[:]
-        if not which_path(self._git[0]):
-            raise Error("Failed to find 'git' executable")
-
-        # `self._env` is a dict representing environment used in all git commands.
-        self._env = os.environ.copy()
+        self.git = GitCommand(config)
 
         if os.path.isfile(dot_path):
             # We're working from a worktree. Let's find the dot_path directory.
@@ -2758,36 +2549,13 @@ class Git(Repository):
         super().__init__(path, dot_path)
 
         self.vcs = "git"
-        self._cinnabar_installed = None
         self.revset = None
-        self.extensions = []
         self.branch = None
 
     @property
     def is_cinnabar_installed(self):
         """Check if Cinnabar extension is callable."""
-        if self._cinnabar_installed is None:
-            # Unfortunately we cannot use --list-cmds as it requires git v2.18+
-
-            # Normally cinnabar will be listed in the 'External commands' section.
-            for line in self.git_out(["help", "--all"]):
-                if re.search(r"^\s+cinnabar\b", line):
-                    self._cinnabar_installed = True
-                    break
-
-            # Cinnabar might be installed in git's exec-path, which won't be
-            # included in the `git help --all` output, nor is it necessarily
-            # on the path.
-            if not self._cinnabar_installed:
-                exec_path = Path(self.git_out(["--exec-path"], split=False))
-                if (exec_path / "git-cinnabar").exists():
-                    self._cinnabar_installed = True
-
-            # Finally check on the system path.
-            if not self._cinnabar_installed:
-                self._cinnabar_installed = which("git-cinnabar") is not None
-
-        return self._cinnabar_installed
+        return self.git.is_cinnabar_installed
 
     @property
     def is_cinnabar_required(self):
@@ -2840,21 +2608,18 @@ class Git(Repository):
         """Quick check for repository at specified path."""
         return os.path.exists(os.path.join(path, ".git"))
 
-    def git(self, command, **kwargs):
+    def git_call(self, command, **kwargs):
         """Call git from the repository path."""
-        check_call(self._git + command, cwd=self.path, env=self._env, **kwargs)
+        self.git.call(command, cwd=self.path, **kwargs)
 
     def git_out(self, command, path=None, extra_env=None, **kwargs):
         """Call git from the repository path and return the result."""
-        env = dict(self._env)
-        if extra_env:
-            env.update(extra_env)
-        return check_output(
-            self._git + command, cwd=path or self.path, env=env, **kwargs
+        return self.git.output(
+            command, cwd=path or self.path, extra_env=extra_env, **kwargs
         )
 
     def cleanup(self):
-        self.git(["gc", "--auto", "--quiet"])
+        self.git_call(["gc", "--auto", "--quiet"])
         if self.branch:
             self.checkout(self.branch)
 
@@ -2954,33 +2719,7 @@ class Git(Repository):
         """Store moz-phab command line args and set the revset."""
         super().set_args(args)
 
-        git_config = parse_config(self.git_out(["config", "--list"], never_log=True))
-
-        safe_options = []
-
-        # Need to use the correct username.
-        if "user.email" not in git_config:
-            raise Error("user.email is not configured in your gitconfig")
-
-        safe_options.extend(["-c", "user.email=%s" % git_config["user.email"]])
-
-        if "user.name" in git_config:
-            safe_options.extend(["-c", "user.name=%s" % git_config["user.name"]])
-
-        if "cinnabar.helper" in git_config:
-            self.extensions.append("cinnabar")
-            safe_options.extend(
-                ["-c", "cinnabar.helper=%s" % git_config["cinnabar.helper"]]
-            )
-
-        if self.args.safe_mode or config.safe_mode:
-            # Ignore the user's Git config
-            # To make Git not read the `~/.gitconfig` we need to temporarily change the
-            # `$HOME` variable.
-            self._env["HOME"] = ""
-            self._env["XDG_CONFIG_HOME"] = ""
-            self._git.extend(safe_options)
-
+        self.git.set_args(args)
         if hasattr(self.args, "start_rev"):
             is_single = hasattr(self.args, "single") and self.args.single
             if self.args.start_rev == DEFAULT_START_REV:
@@ -3191,7 +2930,7 @@ class Git(Repository):
         return hashtag
 
     def checkout(self, node):
-        self.git(["checkout", "--quiet", node])
+        self.git_call(["checkout", "--quiet", node])
 
     def commit(self, body, author=None, author_date=None):
         """Commit the changes in the working directory."""
@@ -3204,7 +2943,7 @@ class Git(Repository):
 
         with temporary_file(body) as temp_f:
             commands += ["-F", temp_f]
-            self.git(commands)
+            self.git_call(commands)
 
     def before_patch(self, node, name):
         """Prepare repository to apply the patches.
@@ -3246,14 +2985,14 @@ class Git(Repository):
                 i += 1
                 branch_name = "%s_%s" % (name, i)
 
-            self.git(["checkout", "-q", "-b", branch_name])
+            self.git_call(["checkout", "-q", "-b", branch_name])
             logger.info("Created branch %s", branch_name)
 
     def apply_patch(self, diff, body, author, author_date):
         # apply the patch as a binary file to ensure the correct line endings
         # is used.
         with temporary_binary_file(diff.encode("utf8")) as patch_file:
-            self.git(["apply", "--index", patch_file])
+            self.git_call(["apply", "--index", patch_file])
 
         self.commit(body, author, author_date)
 
@@ -3352,7 +3091,7 @@ class Git(Repository):
         self._rebase(dest_commit["node"], source_commit["node"])
 
     def _rebase(self, newbase, upstream):
-        self.git(["rebase", "--quiet", "--onto", newbase, upstream])
+        self.git_call(["rebase", "--quiet", "--onto", newbase, upstream])
 
     def _file_size(self, blob):
         return int(self.git_out(["cat-file", "-s", blob], split=False))
@@ -3990,16 +3729,19 @@ def install_arc_if_required():
     if os.path.exists(ARC_COMMAND) and os.path.exists(LIBPHUTIL_PATH):
         return
 
-    check_git("Git is required to install Arcanist.")
+    try:
+        git = GitCommand(config)
+    except Error:
+        logger.error("Git is required to install Arcanist.")
+        raise
 
     logger.info("Installing arc")
     logger.debug("arc command: %s", ARC_COMMAND)
     logger.debug("libphutil path: %s", LIBPHUTIL_PATH)
 
-    check_call(GIT_COMMAND + ["clone", "--depth", "1", ARC_URL, ARC_PATH])
-    check_call(
-        GIT_COMMAND
-        + ["clone", "--depth", "1", "--branch", "stable", LIBPHUTIL_URL, LIBPHUTIL_PATH]
+    git.call(["clone", "--depth", "1", ARC_URL, ARC_PATH])
+    git.call(
+        ["clone", "--depth", "1", "--branch", "stable", LIBPHUTIL_URL, LIBPHUTIL_PATH]
     )
 
 
@@ -4134,7 +3876,7 @@ def update_commits_from_args(commits, args):
         if reviewers:
             # Only the reviewers mentioned in command line args will remain.
             # New reviewers will be marked as "granted" (r=).
-            granted = reviewers[:]
+            granted = reviewers.copy()
             requested = []
 
             # commit["reviewers"]["request|"] is a list containing reviewers
@@ -4505,11 +4247,9 @@ def update_arc():
 
     def update_repo(name, path):
         logger.info("Updating %s...", name)
-        rev = check_output(GIT_COMMAND + ["rev-parse", "HEAD"], split=False, cwd=path)
-        check_call(GIT_COMMAND + ["pull", "--quiet"], cwd=path)
-        if rev != check_output(
-            GIT_COMMAND + ["rev-parse", "HEAD"], split=False, cwd=path
-        ):
+        rev = git.output(["rev-parse", "HEAD"], split=False, cwd=path)
+        git.call(["pull", "--quiet"], cwd=path)
+        if rev != git.output(["rev-parse", "HEAD"], split=False, cwd=path):
             logger.info("%s updated", name)
         else:
             logger.info("Update of %s not required", name)
@@ -4518,7 +4258,11 @@ def update_arc():
         # Nothing to update
         return
 
-    check_git("Git is required to install Arcanist.")
+    try:
+        git = GitCommand(config)
+    except Error:
+        logger.error("Git is required to install Arcanist")
+        raise
 
     try:
         update_repo("libphutil", LIBPHUTIL_PATH)
@@ -4660,7 +4404,7 @@ def self_update(_):
 def apply_patch(diff, cwd):
     """Apply a patch provided in the `diff`."""
     with temporary_binary_file(diff.encode("utf8")) as temp_f:
-        check_call([GIT_COMMAND[0], "apply", temp_f], cwd=cwd)
+        check_call([config.git_command[0], "apply", temp_f], cwd=cwd)
 
 
 def get_base_ref(diff):
@@ -5020,55 +4764,11 @@ def reorganise(repo, args):
 #
 
 
-class ColourFormatter(logging.Formatter):
-    def __init__(self):
-        if DEBUG:
-            fmt = "%(levelname)-8s %(asctime)-13s %(message)s"
-        else:
-            fmt = "%(message)s"
-        super().__init__(fmt)
-        self.log_colours = {"WARNING": 34, "ERROR": 31}  # blue, red
-
-    def format(self, record):
-        result = super().format(record)
-        if HAS_ANSI and record.levelname in self.log_colours:
-            result = "\033[%sm%s\033[0m" % (self.log_colours[record.levelname], result)
-        return result
-
-
-def init_logging():
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(ColourFormatter())
-    stdout_handler.setLevel(logging.DEBUG if DEBUG else logging.INFO)
-    logger.addHandler(stdout_handler)
-
-    file_handler = logging.handlers.RotatingFileHandler(
-        filename=LOG_FILE, maxBytes=LOG_MAX_SIZE, backupCount=LOG_BACKUPS
-    )
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)-13s %(levelname)-8s %(message)s")
-    )
-    file_handler.setLevel(logging.DEBUG)
-    logger.addHandler(file_handler)
-
-    logger.setLevel(logging.DEBUG)
-
-    # clean up old date-based logs
-    now = time.time()
-    for filename in sorted(glob("%s/*.log.*" % os.path.dirname(LOG_FILE))):
-        m = re.search(r"\.(\d\d\d\d)-(\d\d)-(\d\d)$", filename)
-        if not m:
-            continue
-        file_time = calendar.timegm(
-            (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0, 0, 0)
-        )
-        if (now - file_time) / (60 * 60 * 24) > 8:
-            logger.debug("deleting old log file: %s" % os.path.basename(filename))
-            os.unlink(filename)
-
-
 def parse_args(argv):
-    parser = argparse.ArgumentParser()
+    main_parser = argparse.ArgumentParser(add_help=False)
+    main_parser.add_argument("--version", action="store_true", help=argparse.SUPPRESS)
+    parser = argparse.ArgumentParser(parents=[main_parser])
+
     commands = parser.add_subparsers(
         dest="command",
         metavar="COMMAND",
@@ -5354,6 +5054,12 @@ def parse_args(argv):
     ver_parser = commands.add_parser("version", help="Get version number")
     ver_parser.set_defaults(func=log_current_version, needs_repo=False, no_arc=True)
 
+    # help command
+
+    help_parser = commands.add_parser("help")
+    help_parser.add_argument("command", nargs=argparse.OPTIONAL)
+    help_parser.set_defaults(print_help=True)
+
     # if we're called without a command and from within a repository, default to submit.
     if not argv or (
         not (set(argv) & {"-h", "--help"})
@@ -5363,7 +5069,23 @@ def parse_args(argv):
         logger.debug("defaulting to `submit`")
         argv.insert(0, "submit")
 
-    return parser.parse_args(argv)
+    main_args, unknown = main_parser.parse_known_args(argv)
+
+    # map --version to the 'version' command
+    if main_args.version:
+        unknown = ["version"]
+
+    args = parser.parse_args(unknown)
+
+    # handle the help command here as printing help needs access to the parser
+    if hasattr(args, "print_help"):
+        help_argv = ["--help"]
+        if args.command:
+            help_argv.insert(0, args.command)
+        # parse_args calls parser.exit() when passed --help
+        parser.parse_args(help_argv)
+
+    return args
 
 
 def main(argv, *, is_development):
@@ -5376,7 +5098,7 @@ def main(argv, *, is_development):
 
         os.makedirs(MOZBUILD_PATH, exist_ok=True)
 
-        init_logging()
+        init_logging(MOZBUILD_PATH, DEBUG, HAS_ANSI)
         os.environ["MOZPHAB"] = "1"
 
         logger.debug(get_name_and_version())
