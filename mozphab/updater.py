@@ -120,7 +120,7 @@ def self_upgrade():
 
         try:
             check_call(command)
-        except:
+        except Exception:
             temp_exe.rename(exe)
             raise
 
