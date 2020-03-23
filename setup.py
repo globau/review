@@ -8,10 +8,10 @@ if "develop" in sys.argv:
 
 setup(
     name="MozPhab",
-    version="0.1.80",
+    version="0.1.81",
     author="Mozilla",
     author_email="conduit-team@mozilla.com",
-    packages=["mozphab"],
+    packages=["mozphab", "mozphab/commands"],
     entry_points=entry_points,
     url="https://github.com/mozilla-conduit/review",
     license="Mozilla Public License 2.0",
