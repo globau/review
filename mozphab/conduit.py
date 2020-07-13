@@ -4,6 +4,7 @@
 
 import base64
 import datetime
+import hashlib
 import json
 import os
 import urllib.parse
@@ -568,7 +569,7 @@ class ConduitAPI:
             commit["node"]: {
                 "author": commit["author-name"],
                 "authorEmail": commit["author-email"],
-                "time": 0,
+                "time": commit["author-date-epoch"],
                 "summary": commit["title-preview"],
                 "message": message,
                 "commit": conduit.repo.get_public_node(commit["node"]),
@@ -586,11 +587,44 @@ class ConduitAPI:
         )
         self.call("differential.setdiffproperty", api_call_args)
 
-    def file_upload(self, data):
+    def file_upload(self, path, data):
         if not data:
             return
-        data_base64 = base64.standard_b64encode(data)
-        return self.call("file.upload", dict(data_base64=data_base64.decode()))
+        name = os.path.basename(path)
+        allocation = self.call(
+            "file.allocate",
+            dict(
+                name=name,
+                contentLength=len(data),
+                contentHash=hashlib.sha256(data).hexdigest(),
+            ),
+        )
+        file_phid = allocation["filePHID"]
+        if allocation["upload"]:
+            if not file_phid:
+                data_base64 = base64.standard_b64encode(data)
+                file_phid = self.call(
+                    "file.upload", dict(data_base64=data_base64.decode(), name=name)
+                )
+            else:
+                chunks = self.call("file.querychunks", dict(filePHID=file_phid))
+                for chunk in chunks:
+                    if chunk["complete"]:
+                        continue
+                    byte_start = int(chunk["byteStart"])
+                    byte_end = int(chunk["byteEnd"])
+                    data_base64 = base64.standard_b64encode(data[byte_start:byte_end])
+                    self.call(
+                        "file.uploadchunk",
+                        dict(
+                            filePHID=file_phid,
+                            byteStart=byte_start,
+                            data=data_base64.decode(),
+                            dataEncoding="base64",
+                        ),
+                    )
+
+        return file_phid
 
     def whoami(self):
         if "whoami" in cache:

@@ -2,7 +2,6 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-import argparse
 import re
 
 from mozphab import arcanist, environment
@@ -22,6 +21,7 @@ from mozphab.helpers import (
 from mozphab.logger import logger
 from mozphab.spinner import wait_message
 from mozphab.subprocess_wrapper import check_call_by_line
+from mozphab.telemetry import telemetry
 
 DEFAULT_UPDATE_MESSAGE = "Revision updated."
 
@@ -126,6 +126,7 @@ def show_commit_stack(
                 conduit.get_revisions(ids=ids)
 
     for commit in reversed(commits):
+        closed = False
         change_bug_id = False
         is_author = True
         revision = None
@@ -143,6 +144,9 @@ def show_commit_stack(
                         and revision["fields"]["bugzilla.bug-id"]
                         and (commit["bug-id"] != revision["fields"]["bugzilla.bug-id"])
                     )
+
+                    # Check if revision is closed
+                    closed = revision["fields"]["status"]["closed"]
 
                     # Check if comandeering is required
                     whoami = conduit.whoami()
@@ -168,6 +172,13 @@ def show_commit_stack(
                     '   update revisions you own. You can "Commandeer" this\n'
                     "   revision from the web interface if you want to become\n"
                     "   the owner."
+                )
+
+            if closed:
+                logger.warning(
+                    "!! This revision is closed!\n"
+                    "   It will be reopened if submission proceeds.\n"
+                    "   You can stop now and refine the stack range."
                 )
 
             if not commit["bug-id"]:
@@ -327,6 +338,7 @@ def submit(repo, args):
     if environment.DEBUG:
         arcanist.ARC.append("--trace")
 
+    telemetry.metrics.mozphab.submission.preparation_time.start()
     with wait_message("Checking connection to Phabricator."):
         # Check if raw Conduit API can be used
         if not conduit.check():
@@ -343,7 +355,7 @@ def submit(repo, args):
 
     # Find and preview commits to submits.
     with wait_message("Looking for commits.."):
-        commits = repo.commit_stack()
+        commits = repo.commit_stack(single=args.single)
     if not commits:
         raise Error("Failed to find any commits to submit")
     logger.warning(
@@ -391,6 +403,8 @@ def submit(repo, args):
             "be result in a comment on new revisions."
         )
 
+    telemetry.metrics.mozphab.submission.preparation_time.stop()
+
     # Confirmation prompt.
     if args.yes:
         pass
@@ -410,6 +424,8 @@ def submit(repo, args):
             config.write()
 
     # Process.
+    telemetry.metrics.mozphab.submission.commits_count.add(len(commits))
+    telemetry.metrics.mozphab.submission.process_time.start()
     previous_commit = None
     # Collect all existing revisions to get reviewers info.
     rev_ids_to_update = [int(c["rev-id"]) for c in commits if c.get("rev-id")]
@@ -472,6 +488,7 @@ def submit(repo, args):
                 diff = repo.get_diff(commit)
 
             if diff:
+                telemetry.metrics.mozphab.submission.files_count.add(len(diff.changes))
                 with wait_message("Uploading binary file(s)..."):
                     diff.upload_files()
 
@@ -584,6 +601,7 @@ def submit(repo, args):
 
     logger.warning("\nCompleted")
     show_commit_stack(commits, validate=False, show_rev_urls=True)
+    telemetry.metrics.mozphab.submission.process_time.stop()
 
 
 def add_parser(parser):
@@ -716,8 +734,5 @@ def add_parser(parser):
         default=environment.DEFAULT_END_REV,
         help="End revision of range to submit (default: current commit)",
     )
-
-    # arc informs users to pass --trace for more output, so we need to accept it.
-    submit_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
 
     submit_parser.set_defaults(func=submit, needs_repo=True)

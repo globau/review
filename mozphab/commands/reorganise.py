@@ -3,7 +3,6 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-import argparse
 import sys
 
 from collections import OrderedDict
@@ -13,6 +12,7 @@ from mozphab.exceptions import Error
 from mozphab.logger import logger
 from mozphab.helpers import augment_commits_from_body, prompt
 from mozphab.spinner import wait_message
+from mozphab.telemetry import telemetry
 
 
 def to_llist(revisions):
@@ -140,6 +140,8 @@ def stack_transactions(remote_phids, local_phids):
 
 
 def reorganise(repo, args):
+    telemetry.metrics.mozphab.submission.preparation_time.start()
+
     with wait_message("Checking connection to Phabricator."):
         # Check if raw Conduit API can be used
         if not conduit.check():
@@ -231,6 +233,8 @@ def reorganise(repo, args):
                         )
                     )
 
+    telemetry.metrics.mozphab.submission.preparation_time.stop()
+
     if args.yes:
         pass
     else:
@@ -238,10 +242,13 @@ def reorganise(repo, args):
         if res == "No":
             sys.exit(1)
 
+    telemetry.metrics.mozphab.submission.process_time.start()
+
     with wait_message("Applying transactions..."):
         for phid, rev_transactions in transactions.items():
             conduit.edit_revision(rev_id=phid, transactions=rev_transactions)
 
+    telemetry.metrics.mozphab.submission.process_time.stop()
     logger.info("Stack has been reorganised.")
 
 
@@ -278,5 +285,4 @@ def add_parser(parser):
         default=".",
         help="End revision of range to reorganise (default: current commit)",
     )
-    reorg_parser.add_argument("--trace", action="store_true", help=argparse.SUPPRESS)
     reorg_parser.set_defaults(func=reorganise, needs_repo=True, no_arc=True)

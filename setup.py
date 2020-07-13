@@ -8,7 +8,7 @@ if "develop" in sys.argv:
 
 setup(
     name="MozPhab",
-    version="0.1.82",
+    version="0.1.89",
     author="Mozilla",
     author_email="conduit-team@mozilla.com",
     packages=["mozphab", "mozphab/commands"],
@@ -19,5 +19,12 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     python_requires=">=3.5",
-    install_requires=["sentry-sdk", "setuptools"],
+    include_package_data=True,
+    package_data={"mozphab": ["metrics.yaml", "pings.yaml"]},
+    install_requires=[
+        "distro",
+        "glean-sdk>=31.0.0",
+        "sentry-sdk>=0.14.3",
+        "setuptools",
+    ],
 )

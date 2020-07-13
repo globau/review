@@ -24,6 +24,7 @@ from .exceptions import Error
 from .logger import init_logging, logger
 from .spinner import wait_message
 from .sentry import init_sentry, report_to_sentry
+from .telemetry import telemetry
 from .updater import check_for_updates, get_name_and_version
 
 # Known Issues
@@ -41,37 +42,38 @@ def main(argv, *, is_development):
 
         os.makedirs(environment.MOZBUILD_PATH, exist_ok=True)
 
-        init_logging()
-        os.environ["MOZPHAB"] = "1"
-
-        logger.debug(get_name_and_version())
-
         if config.no_ansi:
             environment.HAS_ANSI = False
+        os.environ["MOZPHAB"] = "1"
 
         args = parse_args(argv)
 
-        with_arc = not hasattr(args, "no_arc") or not args.no_arc
-        if with_arc:
-            install_arc_if_required()
-
-        if hasattr(args, "trace") and args.trace:
+        if args.trace:
             environment.DEBUG = True
+
+        init_logging()
+        logger.debug(get_name_and_version())
+
+        if not args.no_arc:
+            install_arc_if_required()
 
         if environment.DEBUG:
             environment.SHOW_SPINNER = False
 
         if args.command != "self-update":
-            check_for_updates(with_arc=with_arc)
+            check_for_updates(with_arc=not args.no_arc)
 
-        if args.command == "patch" and not args.apply_to:
-            args.apply_to = config.apply_patch_to
-
+        repo = None
         if args.needs_repo:
             with wait_message("Starting up.."):
                 repo = repo_from_args(args)
 
             conduit.set_repo(repo)
+
+        telemetry.set_metrics(args, is_development=is_development)
+
+        if repo is not None:
+            telemetry.set_vcs(repo)
             try:
                 args.func(repo, args)
             finally:
@@ -79,6 +81,9 @@ def main(argv, *, is_development):
 
         else:
             args.func(args)
+
+        telemetry.metrics.mozphab.usage.command_time.stop()
+        telemetry.submit()
 
     except KeyboardInterrupt:
         pass
@@ -90,7 +95,7 @@ def main(argv, *, is_development):
             logger.error(traceback.format_exc())
         else:
             logger.error("%s: %s", e.__class__.__name__, e)
-            logger.error("Run moz-phab again with '--trace' to show the stack trace")
+            logger.error("Run moz-phab again with '--trace' to show debugging output")
         report_to_sentry(e)
         sys.exit(1)
 

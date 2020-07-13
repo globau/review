@@ -191,7 +191,7 @@ class Diff:
             change.old_path = a_path
             old = self.change_for(change.old_path)
             if old.kind.name in ["MOVE_AWAY", "COPY_AWAY"]:
-                old.kind = self.Kind("MULTICOPY")
+                old.kind = self.Kind("COPY_AWAY")
             elif old.kind.name != "MULTICOPY":
                 old.kind = self.Kind("COPY_AWAY")
 
@@ -203,7 +203,8 @@ class Diff:
     def upload_files(self):
         for change in list(self.changes.values()):
             for upload in change.uploads:
-                upload["phid"] = conduit.file_upload(upload["value"])
+                path = change.cur_path if upload["type"] == "new" else change.old_path
+                upload["phid"] = conduit.file_upload(path, upload["value"])
 
     def submit(self, commit, message):
         files_changed = sorted(

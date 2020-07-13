@@ -5,6 +5,8 @@
 import os
 import sys
 
+from pathlib import Path
+
 DEBUG = bool(os.getenv("DEBUG"))
 HTTP_ALLOWED = bool(os.getenv("HTTP_ALLOWED"))
 IS_WINDOWS = sys.platform == "win32"
@@ -21,13 +23,14 @@ HAS_ANSI = (
 GIT_COMMAND = ["git.exe" if IS_WINDOWS else "git"]
 HG_COMMAND = ["hg.exe" if IS_WINDOWS else "hg"]
 
-# Switched off temporarily due to https://bugzilla.mozilla.org/show_bug.cgi?id=1565502
-SHOW_SPINNER = False
+SHOW_SPINNER = True
 
 DEFAULT_START_REV = "(auto)"
 DEFAULT_END_REV = "."
 
-HOME_DIR = os.path.expanduser("~")
+HOME_DIR = Path.home()
+
+MOZPHAB_MAIN_DIR = Path(__file__).resolve().parent
 
 # ~/.mozbuild/moz-phab
 MOZBUILD_PATH = os.path.join(

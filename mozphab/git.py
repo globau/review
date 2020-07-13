@@ -9,6 +9,8 @@ import subprocess
 import sys
 import uuid
 
+from datetime import datetime
+
 from mozphab import environment
 
 from .config import config
@@ -19,6 +21,7 @@ from .helpers import prompt, short_node, temporary_binary_file, temporary_file
 from .logger import logger
 from .repository import Repository
 from .spinner import wait_message
+from .telemetry import telemetry
 
 NULL_SHA1 = "0" * 40
 
@@ -42,6 +45,11 @@ class Git(Repository):
         super().__init__(path, dot_path)
 
         self.vcs = "git"
+        m = re.search(r"\d+\.\d+\.\d+", self.git.output(["--version"], split=False))
+        if not m:
+            raise Error("Failed to determine Git version.")
+
+        self.vcs_version = m.group(0)
         self.revset = None
         self.branch = None
 
@@ -329,7 +337,7 @@ class Git(Repository):
 
         return False
 
-    def commit_stack(self):
+    def commit_stack(self, single=False):
         """Collect all the info about commits."""
         if not self.revset:
             # No commits found to submit
@@ -353,15 +361,16 @@ class Git(Repository):
             ) = log_line.split("\n", 6)
             desc = desc.splitlines()
 
-            # Check if the commit is a child of the first one
-            if not rev_list:
-                rev_list = self._git_get_children(node)
-                first_node = node
-            elif not self._is_child(first_node, node, rev_list):
-                raise Error(
-                    "Commit %s is not a child of %s, unable to continue"
-                    % (short_node(node), short_node(first_node))
-                )
+            if not single:
+                # Check if the commit is a child of the first one
+                if rev_list is None:
+                    rev_list = self._git_get_children(node)
+                    first_node = node
+                elif not self._is_child(first_node, node, rev_list):
+                    raise Error(
+                        "Commit %s is not a child of %s, unable to continue"
+                        % (short_node(node), short_node(first_node))
+                    )
 
             # Check if commit has multiple parents, if so - raise an Error
             # We may push the merging commit if it's the first one
@@ -372,6 +381,10 @@ class Git(Repository):
                     % short_node(node)
                 )
 
+            # Tue, 14 Apr 2020 12:02:20 +0000
+            commit_epoch = datetime.strptime(
+                author_date, "%a, %d %b %Y %H:%M:%S %z"
+            ).timestamp()
             commits.append(
                 {
                     "name": short_node(node),
@@ -386,6 +399,7 @@ class Git(Repository):
                     "parent": parents[0],
                     "tree-hash": tree_hash,
                     "author-date": author_date,
+                    "author-date-epoch": commit_epoch,
                     "author-name": author_name,
                     "author-email": author_email,
                 }
@@ -635,6 +649,7 @@ class Git(Repository):
             b_size = self._file_size(b_blob)
 
         file_size = max(a_size, b_size)
+        telemetry.metrics.mozphab.submission.files_size.accumulate(file_size)
 
         # Detect if we're binary, and generate a unified diff
         if b"\0" in a_body or b"\0" in b_body or file_size > environment.MAX_TEXT_SIZE:
@@ -719,31 +734,32 @@ class Git(Repository):
 
             # Collect some stats about the diff, and generate the corpus we
             # want to send to Phabricator.
-            old_eof_newline = True
-            new_eof_newline = True
-            old_line = " "
-            corpus = "".join(lines)
-            for line in lines:
-                if line.endswith("No newline at end of file\n"):
-                    if old_line[0] != "+":
-                        old_eof_newline = False
-                    if old_line[0] != "-":
-                        new_eof_newline = False
-                old_line = line
+            if lines:
+                old_eof_newline = True
+                new_eof_newline = True
+                old_line = " "
+                corpus = "".join(lines)
+                for line in lines:
+                    if line.endswith("No newline at end of file\n"):
+                        if old_line[0] != "+":
+                            old_eof_newline = False
+                        if old_line[0] != "-":
+                            new_eof_newline = False
+                    old_line = line
 
-            change.hunks = [
-                diff.Hunk(
-                    old_off=old_off,
-                    old_len=old_len,
-                    new_off=new_off,
-                    new_len=new_len,
-                    old_eof_newline=old_eof_newline,
-                    new_eof_newline=new_eof_newline,
-                    added=sum(1 for l in lines if l[0] == "+"),
-                    deleted=sum(1 for l in lines if l[0] == "-"),
-                    corpus=corpus,
-                )
-            ]
+                change.hunks = [
+                    diff.Hunk(
+                        old_off=old_off,
+                        old_len=old_len,
+                        new_off=new_off,
+                        new_len=new_len,
+                        old_eof_newline=old_eof_newline,
+                        new_eof_newline=new_eof_newline,
+                        added=sum(1 for l in lines if l[0] == "+"),
+                        deleted=sum(1 for l in lines if l[0] == "-"),
+                        corpus=corpus,
+                    )
+                ]
             change.file_type = diff.FileType("TEXT")
 
         diff.set_change_kind(change, kind_l[0], a_mode, b_mode, a_path, b_path)
@@ -773,13 +789,12 @@ class Git(Repository):
         return diff
 
     def check_vcs(self):
-        try:
-            return super().check_vcs()
-        except Error:
-            if not self.is_cinnabar_installed:
-                logger.error(
-                    "Git Cinnabar extension is required to work on this repository."
-                )
-                raise
+        if self.args.force_vcs:
+            return True
+
+        if self.is_cinnabar_required and not self.is_cinnabar_installed:
+            raise Error(
+                "Git Cinnabar extension is required to work on this repository."
+            )
 
         return True

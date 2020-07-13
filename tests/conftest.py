@@ -7,7 +7,9 @@ import os
 import pytest
 import subprocess
 import sys
+import time
 
+from glean import testing
 from pathlib import Path
 
 from mozphab.commands import submit
@@ -22,6 +24,7 @@ from mozphab import (
     repository,
     simplecache,
     updater,
+    user,
 )
 
 
@@ -99,6 +102,7 @@ def git(
     m_os_path.exists.return_value = True
     m_which.return_value = True
     m_os_path.isfile.return_value = False
+    m_git_git_out.side_effect = ("git version 2.25.0",)
     m_git_get_current_head.return_value = "branch"
     git = Git("x")
     git._phab_vcs = "git"
@@ -132,8 +136,7 @@ def hg(
 
 def hg_out(*args):
     args = ["hg"] + list(args)
-    # TODO: check to `text=True` or `encoding="utf-8"` when Python 3.7 allowed.
-    return subprocess.check_output(args, universal_newlines=True)
+    return subprocess.check_output(args, universal_newlines=True, encoding="utf-8")
 
 
 @pytest.fixture
@@ -177,10 +180,17 @@ def fresh_global_config(tmp_path):
 
 def git_out(*args):
     env = os.environ.copy()
-    args = ["git"] + list(args)
+    args = [
+        "git",
+        "-c",
+        "i18n.logOutputEncoding=UTF-8",
+        "-c",
+        "i18n.commitEncoding=UTF-8",
+    ] + list(args)
     env["DEBUG"] = "1"
-    # TODO: check to `text=True` or `encoding="utf-8"` when Python 3.7 allowed.
-    return subprocess.check_output(args, env=env, universal_newlines=True)
+    return subprocess.check_output(
+        args, env=env, universal_newlines=True, encoding="utf-8"
+    )
 
 
 @pytest.fixture
@@ -211,7 +221,6 @@ def in_process(monkeypatch, safe_environ, request):
     """Set up an environment to run moz-phab within the current process."""
     # Make sure other tests didn't leak and mess up the module-level
     # global variables :/
-    monkeypatch.setattr(environment, "IS_WINDOWS", False)
     monkeypatch.setattr(environment, "DEBUG", True)
     monkeypatch.setattr(environment, "HAS_ANSI", False)
     # Constructing the Mercurial() object modifies os.environ for all tests.
@@ -242,10 +251,23 @@ def in_process(monkeypatch, safe_environ, request):
             }
         )
 
+    # Modify user_data object to not touch the file
+    user.USER_INFO_FILE = mock.Mock()
+    user.USER_INFO_FILE.exists.return_value = False
+    user.user_data = user.UserData()
+    user.user_data.update_from_dict(
+        dict(
+            user_code="#" * 32,
+            is_employee=True,
+            installation_id="#" * 32,
+            last_check=time.time(),
+        )
+    )
+
+    # Allow to define the check_call_by_line function in the testing module
     def check_call_by_line_static(*args, **kwargs):
         return ["Revision URI: http://example.test/D123"]
 
-    # Allow to define the check_call_by_line function in the testing module
     check_call_by_line = getattr(
         request.module, "check_call_by_line", check_call_by_line_static
     )
@@ -279,3 +301,15 @@ def in_process(monkeypatch, safe_environ, request):
 
     read_json_field = getattr(request.module, "read_json_field", read_json_field_local)
     monkeypatch.setattr(repository, "read_json_field", read_json_field)
+
+
+@pytest.fixture
+@mock.patch("mozphab.user.USER_INFO_FILE")
+def user_data(m_file):
+    m_file.exists.return_value = False
+    return user.UserData()
+
+
+@pytest.fixture(name="reset_glean", scope="function", autouse=True)
+def fixture_reset_glean():
+    testing.reset_glean(application_id="mozphab", application_version="0.1.86")

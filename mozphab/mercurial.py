@@ -27,6 +27,7 @@ from .logger import logger
 from .repository import Repository
 from .spinner import wait_message
 from .subprocess_wrapper import check_call, check_output
+from .telemetry import telemetry
 
 MINIMUM_MERCURIAL_VERSION = LooseVersion("4.3.3")
 
@@ -66,6 +67,7 @@ class Mercurial(Repository):
         if not m:
             raise Error("Failed to determine Mercurial version.")
         self.mercurial_version = LooseVersion(m.group(1))
+        self.vcs_version = str(self.mercurial_version)
         if self.mercurial_version < MINIMUM_MERCURIAL_VERSION:
             raise Error(
                 "You are currently running Mercurial %s.  "
@@ -84,8 +86,30 @@ class Mercurial(Repository):
             field = prefix % extension
             if field in hg_config:
                 return hg_config.get(field, "")
-
         return None
+
+    @staticmethod
+    def _get_extensions(*, from_config=None, from_args=None):
+        assert from_config or from_args
+
+        extensions = []
+        if from_config:
+            for name in from_config:
+                if name.startswith("extensions."):
+                    extensions.append(re.sub(r"^extensions\.(?:hgext\.)?", "", name))
+
+        else:
+            args = from_args.copy()
+            while len(args) >= 2:
+                arg = args.pop(0)
+                if arg != "--config":
+                    continue
+                arg = args.pop(0)
+                if arg.startswith("extensions."):
+                    name, value = arg.split("=", maxsplit=1)
+                    extensions.append(re.sub(r"^extensions\.(?:hgext\.)?", "", name))
+
+        return sorted(extensions)
 
     def is_worktree_clean(self):
         status = self._status()
@@ -262,6 +286,17 @@ class Mercurial(Repository):
             os.environ["HGRCPATH"] = ""
             options.extend(safe_options)
 
+            logger.debug(
+                "hg extensions (safe mode): %s",
+                ", ".join(self._get_extensions(from_args=options)),
+            )
+
+        else:
+            logger.debug(
+                "hg extensions: %s",
+                ", ".join(self._get_extensions(from_config=hg_config)),
+            )
+
         self._hg.extend(options)
 
         if hasattr(self.args, "start_rev"):
@@ -299,14 +334,14 @@ class Mercurial(Repository):
 
             self.revset = "%s::%s" % (short_node(start), short_node(end))
 
-    def commit_stack(self):
+    def commit_stack(self, **kwargs):
         # Grab all the info we need about the commits, using randomness as a delimiter.
         boundary = "--%s--\n" % uuid.uuid4().hex
         hg_log = self.hg_out(
             ["log"]
             + [
                 "-T",
-                "{rev}\n{node}\n{date|rfc822date}\n{author|person}\n{author|email}\n"
+                "{rev}\n{node}\n{date|hgdate}\n{author|person}\n{author|email}\n"
                 "{desc}%s" % boundary,
             ]
             + ["-r", self.revset],
@@ -343,7 +378,7 @@ class Mercurial(Repository):
                     "bug-id": None,
                     "reviewers": dict(request=[], granted=[]),
                     "rev-id": None,
-                    "author-date": author_date,
+                    "author-date-epoch": int(author_date.split(" ")[0]),
                     "author-name": author_name,
                     "author-email": author_email,
                 }
@@ -792,6 +827,7 @@ class Mercurial(Repository):
     def _change_add(self, change, fn, _, parent, node):
         """Create a change about adding a file to the commit."""
         meta = self._get_file_meta(fn, node)
+        telemetry.metrics.mozphab.submission.files_size.accumulate(meta["file_size"])
         if meta["binary"]:
             self._change_set_binary(change, "", meta["bin_body"], "", meta["mime"])
         else:
@@ -809,6 +845,7 @@ class Mercurial(Repository):
     def _change_del(self, change, fn, _, parent, node):
         """Create a change about deleting a file from the commit."""
         meta = self._get_file_meta(fn, parent)
+        telemetry.metrics.mozphab.submission.files_size.accumulate(meta["file_size"])
         if meta["binary"]:
             self._change_set_binary(change, meta["bin_body"], "", meta["mime"], "")
         else:
@@ -827,6 +864,8 @@ class Mercurial(Repository):
         """Create a change about modified file in the commit."""
         a_meta = self._get_file_meta(old_fn, parent)
         b_meta = self._get_file_meta(fn, node)
+        file_size = max(a_meta["file_size"], b_meta["file_size"])
+        telemetry.metrics.mozphab.submission.files_size.accumulate(file_size)
         if a_meta["binary"] or b_meta["binary"]:
             self._change_set_binary(
                 change,
@@ -836,7 +875,6 @@ class Mercurial(Repository):
                 b_meta["mime"],
             )
         else:
-            file_size = max(a_meta["file_size"], b_meta["file_size"])
             if a_meta["body"] == b_meta["body"]:
                 lines = a_meta["body"].splitlines(True)
                 lines = [" %s" % l for l in lines]
@@ -917,6 +955,10 @@ class Mercurial(Repository):
         Collects some stats about the diff, and generates the corpus we
         want to send to the Phabricator.
         """
+        change.file_type = Diff.FileType("TEXT")
+        if not lines:
+            return
+
         old_eof_newline = True
         new_eof_newline = True
         old_line = " "
@@ -942,4 +984,3 @@ class Mercurial(Repository):
                 corpus=corpus,
             )
         ]
-        change.file_type = Diff.FileType("TEXT")

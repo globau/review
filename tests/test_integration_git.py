@@ -9,7 +9,7 @@ import pytest
 from callee import Contains
 from .conftest import git_out
 
-from mozphab import exceptions, mozphab
+from mozphab import environment, exceptions, mozphab
 
 mozphab.SHOW_SPINNER = False
 
@@ -72,10 +72,10 @@ def test_submit_create(in_process, git_repo_path, init_sha):
         # differential.revision.edit
         dict(object=dict(id="123")),
     )
-    (git_repo_path / "X").write_text("ą\r\nb\nc\n")
+    (git_repo_path / "X").write_text(u"ą\r\nb\nc\n", encoding="utf-8")
     (git_repo_path / "Y").write_text("no line ending")
     git_out("add", ".")
-    (git_repo_path / "msg").write_text("Ą r?alice")
+    (git_repo_path / "msg").write_text(u"Ą r?alice", encoding="utf-8")
     git_out("commit", "--file", "msg")
     (git_repo_path / "untracked").write_text("a\n")
 
@@ -86,6 +86,7 @@ def test_submit_create(in_process, git_repo_path, init_sha):
 Bug 1 - Ą r?alice
 
 Differential Revision: http://example.test/D123
+
 """
     assert log.strip() == expected.strip()
     assert mock.call("conduit.ping", {}) in call_conduit.call_args_list
@@ -194,10 +195,10 @@ def test_submit_create_added_not_commited(in_process, git_repo_path, init_sha):
         # differential.revision.edit
         dict(object=dict(id="123")),
     )
-    (git_repo_path / "X").write_text("ą\r\nb\nc\n")
+    (git_repo_path / "X").write_text("ą\r\nb\nc\n", encoding="utf-8")
     (git_repo_path / "Y").write_text("no line ending")
     git_out("add", ".")
-    (git_repo_path / "msg").write_text("Ą r?alice")
+    (git_repo_path / "msg").write_text("Ą r?alice", encoding="utf-8")
     git_out("commit", "--file", "msg")
     (git_repo_path / "untracked").write_text("a\n")
     git_out("add", "untracked")
@@ -265,12 +266,15 @@ Differential Revision: http://example.test/D123
 
 
 def test_submit_create_binary(in_process, git_repo_path, init_sha, data_file):
+    call_conduit.reset_mock()
     call_conduit.side_effect = (
         # ping
         dict(),
         # diffusion.repository.search
         dict(data=[dict(phid="PHID-REPO-1", fields=dict(vcs="git"))]),
-        # file upload
+        # file.allocate
+        dict(dict(filePHID=None, upload=True)),
+        # file.upload
         dict(),
         # differential.creatediff
         dict(dict(phid="PHID-DIFF-1", diffid="1")),
@@ -292,6 +296,147 @@ Bug 1 - IMG
 Differential Revision: http://example.test/D123
 """
     assert log.strip() == expected.strip()
+    assert (
+        mock.call(
+            "file.allocate",
+            {"name": "img.png", "contentHash": mock.ANY, "contentLength": 182},
+        )
+        in call_conduit.call_args_list
+    )
+    assert (
+        mock.call("file.upload", {"data_base64": mock.ANY, "name": "img.png"})
+        in call_conduit.call_args_list
+    )
+
+
+def test_submit_create_binary_existing(in_process, git_repo_path, init_sha, data_file):
+    call_conduit.reset_mock()
+    call_conduit.side_effect = (
+        # ping
+        dict(),
+        # diffusion.repository.search
+        dict(data=[dict(phid="PHID-REPO-1", fields=dict(vcs="git"))]),
+        # file.allocate
+        dict(dict(filePHID="PHID-FILE-1", upload=False)),
+        # no file.upload call
+        # differential.creatediff
+        dict(dict(phid="PHID-DIFF-1", diffid="1")),
+        # differential.setdiffproperty
+        dict(),
+        # differential.revision.edit
+        dict(object=dict(id="123")),
+    )
+    shutil.copyfile(str(data_file), str(git_repo_path / "img.png"))
+    git_out("add", ".")
+    git_out("commit", "-m", "IMG")
+
+    mozphab.main(["submit", "--yes", "--bug", "1", init_sha], is_development=True)
+
+    log = git_out("log", "--format=%s%n%n%b", "-1")
+    expected = """
+Bug 1 - IMG
+
+Differential Revision: http://example.test/D123
+"""
+    assert log.strip() == expected.strip()
+    assert (
+        mock.call(
+            "file.allocate",
+            {"name": "img.png", "contentHash": mock.ANY, "contentLength": 182},
+        )
+        in call_conduit.call_args_list
+    )
+    assert mock.call("file.upload", mock.ANY) not in call_conduit.call_args_list
+
+
+def test_submit_create_binary_chunked(in_process, git_repo_path, init_sha, data_file):
+    call_conduit.reset_mock()
+    call_conduit.side_effect = (
+        # ping
+        dict(),
+        # diffusion.repository.search
+        dict(data=[dict(phid="PHID-REPO-1", fields=dict(vcs="git"))]),
+        # file.allocate
+        dict(dict(filePHID="PHID-FILE-1", upload=True)),
+        # file.querychunks
+        [
+            dict(byteStart="0", byteEnd="4194304", complete=False),
+            dict(byteStart="4194304", byteEnd="8388608", complete=False),
+            dict(byteStart="8388608", byteEnd="8425160", complete=False),
+        ],
+        # file.uploadchunk
+        dict(),
+        # file.uploadchunk
+        dict(),
+        # file.uploadchunk
+        dict(),
+        # differential.creatediff
+        dict(dict(phid="PHID-DIFF-1", diffid="1")),
+        # differential.setdiffproperty
+        dict(),
+        # differential.revision.edit
+        dict(object=dict(id="123")),
+    )
+    shutil.copyfile(str(data_file), str(git_repo_path / "img.png"))
+    git_out("add", ".")
+    git_out("commit", "-m", "IMG")
+
+    mozphab.main(["submit", "--yes", "--bug", "1", init_sha], is_development=True)
+
+    log = git_out("log", "--format=%s%n%n%b", "-1")
+    expected = """
+Bug 1 - IMG
+
+Differential Revision: http://example.test/D123
+"""
+    assert log.strip() == expected.strip()
+    assert (
+        mock.call(
+            "file.allocate",
+            {"name": "img.png", "contentHash": mock.ANY, "contentLength": 182},
+        )
+        in call_conduit.call_args_list
+    )
+    assert (
+        mock.call("file.querychunks", {"filePHID": "PHID-FILE-1"})
+        in call_conduit.call_args_list
+    )
+    assert (
+        mock.call(
+            "file.uploadchunk",
+            {
+                "filePHID": "PHID-FILE-1",
+                "byteStart": 0,
+                "data": mock.ANY,
+                "dataEncoding": "base64",
+            },
+        )
+        in call_conduit.call_args_list
+    )
+    assert (
+        mock.call(
+            "file.uploadchunk",
+            {
+                "filePHID": "PHID-FILE-1",
+                "byteStart": 4194304,
+                "data": mock.ANY,
+                "dataEncoding": "base64",
+            },
+        )
+        in call_conduit.call_args_list
+    )
+    assert (
+        mock.call(
+            "file.uploadchunk",
+            {
+                "filePHID": "PHID-FILE-1",
+                "byteStart": 8388608,
+                "data": mock.ANY,
+                "dataEncoding": "base64",
+            },
+        )
+        in call_conduit.call_args_list
+    )
 
 
 def test_submit_update(in_process, git_repo_path, init_sha):
@@ -306,7 +451,7 @@ def test_submit_update(in_process, git_repo_path, init_sha):
                 {
                     "fields": {
                         "bugzilla.bug-id": "1",
-                        "status": {"value": "needs-review"},
+                        "status": {"value": "needs-review", "closed": False},
                         "authorPHID": "PHID-USER-1",
                     },
                     "phid": "PHID-DREV-y7x5hvdpe2gyerctdqqz",
@@ -325,7 +470,7 @@ def test_submit_update(in_process, git_repo_path, init_sha):
         dict(object=dict(id="123")),
     )
     testfile = git_repo_path / "X"
-    testfile.write_text("ą")
+    testfile.write_text("ą", encoding="utf-8")
     git_out("add", ".")
     msgfile = git_repo_path / "msg"
     msgfile.write_text(
@@ -333,7 +478,8 @@ def test_submit_update(in_process, git_repo_path, init_sha):
 Bug 1 - Ą
 
 Differential Revision: http://example.test/D123
-"""
+""",
+        encoding="utf-8",
     )
     git_out("commit", "--file", "msg")
 
@@ -356,6 +502,9 @@ Differential Revision: http://example.test/D123
 
 
 def test_submit_remove_cr(in_process, git_repo_path, init_sha):
+    if environment.IS_WINDOWS:
+        pytest.skip("Removing CR will not work on Windows.")
+
     call_conduit.side_effect = (
         # CREATE
         dict(),
@@ -533,7 +682,7 @@ def test_submit_update_no_message(in_process, git_repo_path, init_sha):
                 {
                     "fields": {
                         "bugzilla.bug-id": "1",
-                        "status": {"value": "needs-review"},
+                        "status": {"value": "needs-review", "closed": False},
                         "authorPHID": "PHID-USER-1",
                     },
                     "phid": "PHID-DREV-y7x5hvdpe2gyerctdqqz",
@@ -550,16 +699,15 @@ def test_submit_update_no_message(in_process, git_repo_path, init_sha):
         # differential.revision.edit
         dict(object=dict(id="123")),
     )
-    testfile = git_repo_path / "X"
-    testfile.write_text(u"ą")
+    (git_repo_path / "X").write_text(u"ą", encoding="utf-8")
     git_out("add", ".")
-    msgfile = git_repo_path / "msg"
-    msgfile.write_text(
+    (git_repo_path / "msg").write_text(
         u"""\
 Bug 1 - Ą
 
 Differential Revision: http://example.test/D123
-"""
+""",
+        encoding="utf-8",
     )
     git_out("commit", "--file", "msg")
 
@@ -657,7 +805,7 @@ def test_submit_update_arc(in_process, git_repo_path, init_sha):
                 {
                     "fields": {
                         "bugzilla.bug-id": "1",
-                        "status": {"value": "needs-review"},
+                        "status": {"value": "needs-review", "closed": False},
                         "authorPHID": "PHID-USER-1",
                     },
                     "phid": "PHID-DREV-y7x5hvdpe2gyerctdqqz",
@@ -714,7 +862,7 @@ def test_submit_update_bug_id_arc(in_process, git_repo_path, init_sha):
                     "phid": "PHID-REV-1",
                     "fields": {
                         "bugzilla.bug-id": "1",
-                        "status": {"value": "needs-review"},
+                        "status": {"value": "needs-review", "closed": False},
                         "authorPHID": "PHID-USER-1",
                     },
                     "attachments": {"reviewers": {"reviewers": []}},
@@ -770,7 +918,7 @@ def test_submit_update_revision_not_found(in_process, git_repo_path, init_sha):
                 {
                     "fields": {
                         "bugzilla.bug-id": "1",
-                        "status": {"value": "needs-review"},
+                        "status": {"value": "needs-review", "closed": False},
                     },
                     "phid": "PHID-DREV-y7x5hvdpe2gyerctdqqz",
                     "id": 123,
@@ -786,7 +934,7 @@ def test_submit_update_revision_not_found(in_process, git_repo_path, init_sha):
         dict(data=[]),
     )
     testfile = git_repo_path / "X"
-    testfile.write_text(u"ą")
+    testfile.write_text(u"ą", encoding="utf-8")
     git_out("add", ".")
     msgfile = git_repo_path / "msg"
     msgfile.write_text(
@@ -794,7 +942,8 @@ def test_submit_update_revision_not_found(in_process, git_repo_path, init_sha):
 Bug 1 - Ą
 
 Differential Revision: http://example.test/D123
-"""
+""",
+        encoding="utf-8",
     )
     git_out("commit", "--file", "msg")
     testfile.write_text(u"missing repo")
