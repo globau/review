@@ -513,6 +513,9 @@ class Git(Repository):
 
         self.commit(body, author, author_date)
 
+    def format_patch(self, diff, body, author, author_date):
+        return diff
+
     def _get_current_head(self):
         """Return current's HEAD symbolic link."""
         symbolic = self.git_out(["symbolic-ref", "HEAD"], split=False)
