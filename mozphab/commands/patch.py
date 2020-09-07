@@ -73,7 +73,7 @@ def patch(repo, args):
 
     revision = revs[0]
 
-    if not args.skip_dependencies:
+    if not args.no_children:
         with wait_message("Fetching D%s children.." % args.revision_id):
             try:
                 children = conduit.get_successor_phids(
@@ -95,7 +95,7 @@ def patch(repo, args):
                 )
                 res = prompt(
                     "Revision D%s has %s.  Would you like to patch the "
-                    "full stack?." % (args.revision_id, children_msg),
+                    "full stack?" % (args.revision_id, children_msg),
                     ["Yes", "No", "Always"],
                 )
                 if res == "Always":
@@ -249,7 +249,9 @@ def check_revision_id(value):
 def add_parser(parser):
     patch_parser = parser.add_parser("patch", help="Patch from Phabricator revision")
     patch_parser.add_argument(
-        "revision_id", type=check_revision_id, help="Revision number"
+        "revision_id",
+        type=check_revision_id,
+        help="Revision number",
     )
     patch_group = patch_parser.add_mutually_exclusive_group()
     patch_group.add_argument(
@@ -286,12 +288,16 @@ def add_parser(parser):
         help="(Git only) Do not create the branch",
     )
     patch_parser.add_argument(
+        "--no-children",
+        "--nochildren",
         "--skip-dependencies",
         action="store_true",
-        help="Do not search for dependencies; patch only one revision",
+        help="Do not apply descendants/children of this patch",
     )
     patch_parser.add_argument(
-        "--include-abandoned", action="store_true", help="Apply abandoned revisions"
+        "--include-abandoned",
+        action="store_true",
+        help="Apply abandoned revisions",
     )
     patch_parser.add_argument(
         "--yes",

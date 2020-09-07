@@ -122,7 +122,7 @@ def test_patch(
             raw=False,
             apply_to="base",
             yes=False,
-            skip_dependencies=False,
+            no_children=False,
             include_abandoned=False,
             force_vcs=False,
         ):
@@ -131,7 +131,7 @@ def test_patch(
             self.raw = raw
             self.apply_to = apply_to
             self.yes = yes
-            self.skip_dependencies = skip_dependencies
+            self.no_children = no_children
             self.include_abandoned = include_abandoned
             self.force_vcs = force_vcs
 
@@ -231,8 +231,8 @@ def test_patch(
     m_apply_patch.assert_not_called()
     m_logger.info.assert_called_with("raw")
 
-    # skip-dependencies
-    git.args = Args(raw=True, skip_dependencies=True)
+    # --no-children
+    git.args = Args(raw=True, no_children=True)
     m_get_successor_phids.reset_mock()
     patch.patch(git, git.args)
     m_get_successor_phids.assert_not_called()
