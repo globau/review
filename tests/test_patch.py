@@ -123,6 +123,8 @@ def test_patch(
             apply_to="base",
             yes=False,
             no_children=False,
+            no_parents=False,
+            no_dependencies=False,
             include_abandoned=False,
             force_vcs=False,
         ):
@@ -132,6 +134,8 @@ def test_patch(
             self.apply_to = apply_to
             self.yes = yes
             self.no_children = no_children
+            self.no_parents = no_parents
+            self.no_dependencies = no_dependencies
             self.include_abandoned = include_abandoned
             self.force_vcs = force_vcs
 

@@ -64,90 +64,80 @@ def patch(repo, args):
                 % ("shelve" if isinstance(repo, Mercurial) else "stash")
             )
 
+    # --no-dependencies is an alias for --no-parents + --no-children
+    if args.no_dependencies:
+        args.no_parents = True
+        args.no_children = True
+
     # Get the target revision
     with wait_message("Fetching D%s.." % args.revision_id):
-        revs = conduit.get_revisions(ids=[args.revision_id])
-
-    if not revs:
+        revisions = conduit.get_revisions(ids=[args.revision_id])
+    if not revisions:
         raise Error("Revision not found")
+    revision = revisions[0]
 
-    revision = revs[0]
+    parents = []
+    if not args.no_parents:
+        with wait_message("Fetching D%s's parents.." % args.revision_id):
+            try:
+                parents = conduit.get_ancestor_phids(revision["phid"])
+            except NonLinearException:
+                raise Error(
+                    "Revision D%s has non-linear dependency relationships.\n"
+                    "Unable to patch the stack." % args.revision_id
+                )
 
+    children = []
     if not args.no_children:
-        with wait_message("Fetching D%s children.." % args.revision_id):
+        with wait_message("Fetching D%s's children.." % args.revision_id):
             try:
                 children = conduit.get_successor_phids(
                     revision["phid"], include_abandoned=args.include_abandoned
                 )
-                non_linear = False
             except NonLinearException:
+                logger.warning(
+                    "Revision D%s has non-linear dependency relationships.\n"
+                    "Unable to apply child revisions.",
+                    args.revision_id,
+                )
+
+    if not args.yes:
+        if children and not config.always_full_stack:
+            children_msg = "a child commit" if len(children) == 1 else "child commits"
+            res = prompt(
+                "Revision D%s has %s.  Would you like to patch all "
+                "children?" % (args.revision_id, children_msg),
+                ["Yes", "No", "Always"],
+            )
+            if res == "Always":
+                config.always_full_stack = True
+                config.write()
+            elif res == "No":
                 children = []
-                non_linear = True
 
-        patch_children = True
-        if children:
-            if args.yes or config.always_full_stack:
-                patch_children = True
+    # Fetch revision data
+    if parents:
+        with wait_message("Fetching related revisions.."):
+            revisions.extend(conduit.get_revisions(phids=parents))
+        revisions.reverse()
 
-            else:
-                children_msg = (
-                    "a child commit" if len(children) == 1 else "child commits"
-                )
-                res = prompt(
-                    "Revision D%s has %s.  Would you like to patch the "
-                    "full stack?" % (args.revision_id, children_msg),
-                    ["Yes", "No", "Always"],
-                )
-                if res == "Always":
-                    config.always_full_stack = True
-                    config.write()
-
-                patch_children = res == "Yes" or res == "Always"
-
-            if patch_children:
-                if non_linear and not args.yes:
-                    logger.warning(
-                        "Revision D%s has a non-linear successor graph.\n"
-                        "Unable to apply the full stack.",
-                        args.revision_id,
-                    )
-                    res = prompt("Continue with only part of the stack?", ["Yes", "No"])
-                    if res == "No":
-                        return
-
-        # Get list of PHIDs in the stack
-        try:
-            with wait_message("Fetching D%s parents.." % args.revision_id):
-                phids = conduit.get_ancestor_phids(revision["phid"])
-        except NonLinearException:
-            raise Error("Non linear dependency detected. Unable to patch the stack.")
-
-        # Pull revisions data
-        if phids:
-            with wait_message("Fetching related revisions.."):
-                revs.extend(conduit.get_revisions(phids=phids))
-            revs.reverse()
-
-        if children and patch_children:
-            with wait_message("Fetching related revisions.."):
-                revs.extend(conduit.get_revisions(phids=children))
-
-    # Set the target id
-    rev_id = revs[-1]["id"]
+    if children:
+        with wait_message("Fetching related revisions.."):
+            revisions.extend(conduit.get_revisions(phids=children))
 
     if not args.raw:
         logger.info(
             "Patching revision%s: %s",
-            "s" if len(revs) > 1 else "",
-            " ".join(["D%s" % r["id"] for r in revs]),
+            "s" if len(revisions) > 1 else "",
+            " ".join(["D%s" % r["id"] for r in revisions]),
         )
 
     # Pull diffs
     with wait_message("Downloading patch information.."):
-        diffs = conduit.get_diffs([r["fields"]["diffPHID"] for r in revs])
+        diffs = conduit.get_diffs([r["fields"]["diffPHID"] for r in revisions])
 
     if not args.no_commit and not args.raw:
-        for rev in revs:
+        for rev in revisions:
             diff = diffs[rev["fields"]["diffPHID"]]
             if not diff["attachments"]["commits"]["commits"]:
                 raise Error(
@@ -155,12 +145,15 @@ def patch(repo, args):
                     "Use `--no-commit` to patch the working tree." % rev["id"]
                 )
 
+    # Set the target id
+    target_revision_id = revisions[-1]["id"]
+
     base_node = None
     if not args.raw:
         args.apply_to = args.apply_to or config.apply_patch_to
 
         if args.apply_to == "base":
-            base_node = get_base_ref(diffs[revs[0]["fields"]["diffPHID"]])
+            base_node = get_base_ref(diffs[revisions[0]["fields"]["diffPHID"]])
 
             if not base_node:
                 raise Error(
@@ -184,11 +177,11 @@ def patch(repo, args):
 
                 raise Error(msg)
 
-        branch_name = None if args.no_commit else "phab-D%s" % rev_id
+        branch_name = None if args.no_commit else "phab-D%s" % target_revision_id
         repo.before_patch(base_node, branch_name)
 
     parent = None
-    for rev in revs:
+    for rev in revisions:
         # Prepare the body using just the data from Phabricator
         body = prepare_body(
             rev["fields"]["title"],
@@ -222,11 +215,11 @@ def patch(repo, args):
             except subprocess.CalledProcessError:
                 raise Error("Patch failed to apply")
 
-        if not args.raw and rev["id"] != revs[-1]["id"]:
+        if not args.raw and rev["id"] != revisions[-1]["id"]:
             logger.info("D%s applied", rev["id"])
 
     if not args.raw:
-        logger.warning("D%s applied", rev_id)
+        logger.warning("D%s applied", target_revision_id)
 
 
 def check_revision_id(value):
@@ -288,11 +281,21 @@ def add_parser(parser):
         help="(Git only) Do not create the branch",
     )
     patch_parser.add_argument(
+        "--no-parents",
+        action="store_true",
+        help="Do not apply parents/ancestors of this patch",
+    )
+    patch_parser.add_argument(
         "--no-children",
-        "--nochildren",
+        action="store_true",
+        help="Do not apply children/descendants of this patch",
+    )
+    patch_parser.add_argument(
+        "--no-dependencies",
         "--skip-dependencies",
         action="store_true",
-        help="Do not apply descendants/children of this patch",
+        help="Do not apply dependencies of this patch "
+        "(same as --no-parents and --no-children)",
     )
     patch_parser.add_argument(
         "--include-abandoned",
