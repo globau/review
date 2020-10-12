@@ -155,6 +155,9 @@ class Repository(object):
     def apply_patch(self, diff, body, author, author_date):
         """Apply the patch and commit the changes."""
 
+    def format_patch(self, diff, body, author, author_date):
+        """Format a patch appropriate for importing."""
+
     def check_commits_for_submit(
         self, commits, *, validate_reviewers=True, require_bug=True
     ):
@@ -285,8 +288,7 @@ class Repository(object):
         return False
 
     def _api_url(self):
-        """Return a base URL for conduit API call
-        """
+        """Return a base URL for conduit API call"""
         return urllib.parse.urljoin(self.phab_url, "api/")
 
     @property

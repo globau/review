@@ -271,7 +271,7 @@ class Git(Repository):
 
     @staticmethod
     def _get_direct_children(node, rev_list):
-        """ Return direct children of the commit.
+        """Return direct children of the commit.
 
         Args:
             node: The SHA1 of a node to check for direct children
@@ -517,6 +517,9 @@ class Git(Repository):
             self.git_call(["apply", "--index", patch_file])
 
         self.commit(body, author, author_date)
+
+    def format_patch(self, diff, body, author, author_date):
+        return diff
 
     def _get_current_head(self):
         """Return current's HEAD symbolic link."""

@@ -9,6 +9,7 @@ import pytest
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 from glean import testing
@@ -21,6 +22,7 @@ from mozphab.mercurial import Mercurial
 from mozphab import (
     arcanist,
     conduit,
+    config as config_module,
     environment,
     mozphab,
     repository,
@@ -117,7 +119,12 @@ def git(
 @mock.patch("mozphab.helpers.which")
 @mock.patch("mozphab.repository.read_json_field")
 def hg(
-    m_read_json_field, m_which, m_os_path, m_hg_hg_out, safe_environ, repo_phab_url,
+    m_read_json_field,
+    m_which,
+    m_os_path,
+    m_hg_hg_out,
+    safe_environ,
+    repo_phab_url,
 ):
     m_read_json_field.return_value = "TEST"
     m_os_path.join = os.path.join
@@ -166,7 +173,7 @@ def find_script_path(name):
 def hg_repo_path(monkeypatch, tmp_path):
     """Build a usable HG repository. Return the pathlib.Path to the repo."""
     phabricator_uri = "http://example.test"
-    repo_path = tmp_path / "repo"
+    repo_path = tmp_path / "hg-repo"
     repo_path.mkdir()
     monkeypatch.chdir(str(repo_path))
     arcconfig = repo_path / ".arcconfig"
@@ -220,7 +227,7 @@ def git_out(*args):
 def git_repo_path(monkeypatch, tmp_path):
     """Build a usable Git repository. Return the pathlib.Path to the repo."""
     phabricator_uri = "http://example.test"
-    repo_path = tmp_path / "repo"
+    repo_path = tmp_path / "git-repo"
     repo_path.mkdir()
     monkeypatch.chdir(str(repo_path))
     arcconfig = repo_path / ".arcconfig"
@@ -240,8 +247,18 @@ def safe_environ(monkeypatch):
 
 
 @pytest.fixture
-def in_process(monkeypatch, safe_environ, request):
+def config():
+    """Replace the original config with the fake one."""
+    with tempfile.NamedTemporaryFile() as temp:
+        return config_module.Config(filename=temp.name)
+
+
+@pytest.fixture
+def in_process(monkeypatch, safe_environ, request, config):
     """Set up an environment to run moz-phab within the current process."""
+    monkeypatch.setattr("mozphab.config.config", config)
+    monkeypatch.setattr("mozphab.git.config", config)
+    monkeypatch.setattr("mozphab.mercurial.config", config)
     # Make sure other tests didn't leak and mess up the module-level
     # global variables :/
     monkeypatch.setattr(environment, "DEBUG", True)

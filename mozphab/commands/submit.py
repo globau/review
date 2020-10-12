@@ -377,7 +377,9 @@ def submit(repo, args):
     try:
         with wait_message("Checking commits.."):
             repo.check_commits_for_submit(
-                commits, validate_reviewers=not args.wip, require_bug=not args.no_bug,
+                commits,
+                validate_reviewers=not args.wip,
+                require_bug=not args.no_bug,
             )
     except Error as e:
         if not args.force:
@@ -405,6 +407,7 @@ def submit(repo, args):
         )
 
     telemetry.metrics.mozphab.submission.preparation_time.stop()
+    telemetry.metrics.mozphab.submission.commits_count.add(len(commits))
 
     # Confirmation prompt.
     if args.yes:
@@ -425,7 +428,6 @@ def submit(repo, args):
             config.write()
 
     # Process.
-    telemetry.metrics.mozphab.submission.commits_count.add(len(commits))
     telemetry.metrics.mozphab.submission.process_time.start()
     previous_commit = None
     # Collect all existing revisions to get reviewers info.
@@ -437,7 +439,9 @@ def submit(repo, args):
 
         revisions_to_update = {str(r["id"]): r for r in list_to_update}
 
+    last_node = commits[-1]["orig-node"]
     for commit in commits:
+        check_in_needed = args.check_in_needed and commit["orig-node"] == last_node
         # Only revisions being updated have an ID.  Newly created ones don't.
         is_update = bool(commit["rev-id"])
         revision_to_update = (
@@ -507,6 +511,7 @@ def submit(repo, args):
                         diff_phid=diff_phid,
                         wip=args.wip,
                         comment=args.message,
+                        check_in_needed=check_in_needed,
                     )
             else:
                 with wait_message("Creating a new revision..."):
@@ -517,6 +522,7 @@ def submit(repo, args):
                         diff_phid,
                         has_commit_reviewers,
                         wip=args.wip,
+                        check_in_needed=check_in_needed,
                     )
 
             revision_url = "%s/D%s" % (repo.phab_url, rev["object"]["id"])
@@ -631,7 +637,9 @@ def add_parser(parser):
         help="Submit with confirmation (default: %s)" % (not config.auto_submit),
     )
     submit_parser.add_argument(
-        "--message", "-m", help="Provide a custom update message (default: none)",
+        "--message",
+        "-m",
+        help="Provide a custom update message (default: none)",
     )
     submit_parser.add_argument(
         "--force",
@@ -674,6 +682,11 @@ def add_parser(parser):
         help="Do not run lint (default: lint changed files if configured)",
     )
     submit_parser.add_argument(
+        "--check-in-needed",
+        action="store_true",
+        help="Add a `check-in-needed tag to the top most revision",
+    )
+    submit_parser.add_argument(
         "--wip",
         "--plan-changes",
         action="store_true",
@@ -705,7 +718,10 @@ def add_parser(parser):
         help='Set upstream branch to detect the starting commit (default: "")',
     )
     submit_parser.add_argument(
-        "--arc", dest="no_arc", action="store_false", help="Submits with Arcanist",
+        "--arc",
+        dest="no_arc",
+        action="store_false",
+        help="Submits with Arcanist",
     )
     submit_parser.add_argument(
         "--force-vcs",
@@ -719,7 +735,10 @@ def add_parser(parser):
         help="Run VCS with only necessary extensions",
     )
     submit_parser.add_argument(
-        "--single", "-s", action="store_true", help="Submit a single commit",
+        "--single",
+        "-s",
+        action="store_true",
+        help="Submit a single commit",
     )
     submit_parser.add_argument(
         "start_rev",
