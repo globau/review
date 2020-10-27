@@ -42,6 +42,40 @@ def create_temp_fn(*filenames):
     return m_temp_fn
 
 
+def search_diff(diff=1, phid="PHID-DIFF-1", node="aaa000aaa000"):
+    return {
+        "id": diff,
+        "phid": phid,
+        "attachments": {"commits": {"commits": [{"identifier": node}]}},
+    }
+
+
+def search_rev(
+    rev=1,
+    phid="PHID-DREV-1",
+    bug="1",
+    status="needs-review",
+    closed=False,
+    author="PHID-USER-1",
+    diff="PHID-DIFF-1",
+    reviewers=None,
+):
+    reviewers = reviewers or []
+    return {
+        "id": rev,
+        "phid": phid,
+        "fields": {
+            "bugzilla.bug-id": bug,
+            "status": {"value": status, "closed": closed},
+            "authorPHID": author,
+            "diffPHID": diff,
+        },
+        "attachments": {
+            "reviewers": {"reviewers": [{"reviewerPHID": r} for r in reviewers]}
+        },
+    }
+
+
 @pytest.fixture
 def hg_sha():
     def ret():
@@ -114,15 +148,17 @@ def git(
 
 
 @pytest.fixture
-@mock.patch("mozphab.mercurial.Mercurial.hg_out")
+@mock.patch("mozphab.mercurial.Mercurial.repository")
 @mock.patch("mozphab.repository.os.path")
 @mock.patch("mozphab.helpers.which")
 @mock.patch("mozphab.repository.read_json_field")
+@mock.patch("mozphab.mercurial.hglib.open")
 def hg(
+    m_hglib_open,
     m_read_json_field,
     m_which,
     m_os_path,
-    m_hg_hg_out,
+    m_repository,
     safe_environ,
     repo_phab_url,
 ):
@@ -131,10 +167,7 @@ def hg(
     m_os_path.exists.return_value = True
     m_which.return_value = True
     m_os_path.isfile.return_value = False
-    m_hg_hg_out.side_effect = [
-        "Mercurial Distributed SCM (version 4.7.1)",
-        ["ui.username=username", "extensions.evolve="],
-    ]
+    m_repository.version = 4, 7, 1, "bleh"
     mozphab.config.hg_command = ["hg"]
     hg = Mercurial("x")
     hg.use_evolve = True

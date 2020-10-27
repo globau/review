@@ -8,7 +8,7 @@ if "develop" in sys.argv:
 
 setup(
     name="MozPhab",
-    version="0.1.90",
+    version="0.1.92",
     author="Mozilla",
     author_email="conduit-team@mozilla.com",
     packages=["mozphab", "mozphab/commands"],
@@ -26,6 +26,7 @@ setup(
     install_requires=[
         "distro",
         "glean-sdk>=31.0.0",
+        "python-hglib==2.6.1",
         "sentry-sdk>=0.14.3",
         "setuptools",
     ],
