@@ -83,7 +83,7 @@ jobs:
           command: |
             mkdir test-reports
             function RunTest {
-              & python3 -m pytest -vv @args
+              & python -m pytest -vv @args
               if ($LASTEXITCODE -ne 0) {
                 exit $LASTEXITCODE
               }
