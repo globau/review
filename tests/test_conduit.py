@@ -60,6 +60,7 @@ def test_build_request(m_load_api_token):
         ),
         "method": "POST",
         "url": "https://api_url/method",
+        "headers": {"User-Agent": mock.ANY},
     }
 
     # provided token
@@ -78,6 +79,7 @@ def test_build_request(m_load_api_token):
         ),
         "method": "POST",
         "url": "https://api_url/method",
+        "headers": {"User-Agent": mock.ANY},
     }
 
     # unicode
@@ -96,6 +98,7 @@ def test_build_request(m_load_api_token):
         ),
         "method": "POST",
         "url": "https://api_url/method",
+        "headers": {"User-Agent": mock.ANY},
     }
 
     # empty dict, empty list
@@ -114,6 +117,7 @@ def test_build_request(m_load_api_token):
         ),
         "method": "POST",
         "url": "https://api_url/method",
+        "headers": {"User-Agent": mock.ANY},
     }
 
 
